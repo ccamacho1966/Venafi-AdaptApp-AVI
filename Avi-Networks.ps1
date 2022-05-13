@@ -38,7 +38,7 @@ Passwd|Not Used|000
 -----END FIELD DEFINITIONS-----
 #>
 
-$Script:AdaptableAppVer = "202205101736"
+$Script:AdaptableAppVer = "202205131716"
 $Script:AdaptableAppDrv = "Avi-Networks"
 
 # need the following to interface with an untrusted certificate
@@ -178,7 +178,7 @@ function Generate-CSR
         $subject.Add( "country", $Specific.SubjectDn.C )
     }
 
-    $sans_dns = @() + $($Specific.SubjAltNames.DNS | ? {$_})  # an array of DNS Subject Alternative Names, possibly empty
+    $sans_dns = @() + $($Specific.SubjAltNames.DNS | Where-Object {$_})  # an array of DNS Subject Alternative Names, possibly empty
 
     try {
         $session = Get-AviSession $General.HostAddress $General.UserName $General.UserPass
@@ -220,7 +220,7 @@ function Generate-CSR
         return @{ Result="Success"; Pkcs10=$csr }
     }
     catch {
-        throw Decode-Error($_.Exception)
+        throw Select-ErrorMessage($_.Exception)
     }
 }
 
@@ -322,7 +322,7 @@ function Install-Chain
     }
     catch
     {
-        throw Decode-Error($_.Exception)
+        throw Select-ErrorMessage($_.Exception)
     }
 }
 
@@ -472,7 +472,7 @@ function Install-Certificate
         }
     }
     catch {
-        throw Decode-Error($_.Exception)
+        throw Select-ErrorMessage($_.Exception)
     }
 }
 
@@ -620,7 +620,7 @@ function Extract-Certificate
     catch {
         Write-VenDebugLog "API error: $($_.Exception)"
         Write-VenDebugLog "FAILED to extract certificate - Returning control to Venafi"
-        throw Decode-Error($_.Exception)
+        throw Select-ErrorMessage($_.Exception)
     }
 }
 
@@ -675,7 +675,7 @@ function Extract-PrivateKey
         }
     }
     catch {
-        throw Decode-Error($_.Exception)
+        throw Select-ErrorMessage($_.Exception)
     }
 }
 
@@ -759,7 +759,6 @@ function Discover-Certificates
 	$all_vs = Get-AllVS $General $login_session
     $ref_content_map = @{}
     $results = @()
-    [int] $count = 1
     $sitesTotal=$sitesSSL=$sitesClear=0
     foreach($vs in $all_vs){
         $sitesTotal++
@@ -815,7 +814,7 @@ function Write-VenDebugLog
     filter Add-TS {"$(Get-Date -Format o): $_"}
 
     # if the logfile isn't initialized then do nothing and return immediately
-    if ($Script:venDebugFile -eq $null) { return }
+    if ($null -eq $Script:venDebugFile) { return }
 
     if ($NoFunctionTag.IsPresent) {
         $taggedLog = $LogMessage
@@ -836,13 +835,13 @@ function Initialize-VenDebugLog
         [Parameter(Position=0, Mandatory)][System.Collections.Hashtable]$General
     )
 
-    if ($Script:venDebugFile -ne $null) {
+    if ($null -ne $Script:venDebugFile) {
         Write-VenDebugLog "Called by $((Get-PSCallStack)[1].Command)"
         Write-VenDebugLog 'WARNING: Initialize-VenDebugLog() called more than once!'
         return
     }
 
-    if ($DEBUG_FILE -eq $null) {
+    if ($null -eq $DEBUG_FILE) {
         # do nothing and return immediately if debug isn't on
         if ($General.VarBool1 -eq $false) { return }
         # pull Venafi base directory from registry for global debug flag
@@ -904,11 +903,11 @@ function Invoke-AviRestMethod
 		if ($_.Exception.Response) {
 			[string] $debug_msg = "Status Code of response : {0}" -f $_.Exception.Response.StatusCode.value__.ToString()
             Write-VenDebugLog $debug_msg
-			$debug_msg = Decode-Error $_.Exception
+			$debug_msg = Select-ErrorMessage $_.Exception
             Write-VenDebugLog $debug_msg
 		}
 		else {
-			$debug_msg = Decode-Error $_.Exception
+			$debug_msg = Select-ErrorMessage $_.Exception
             Write-VenDebugLog $debug_msg
 		}
 		throw $_
@@ -1080,7 +1079,7 @@ function Get-CACertName( [System.Security.Cryptography.X509Certificates.X509Cert
 }
 
 
-function Decode-Error( [Exception] $ex )
+function Select-ErrorMessage( [Exception] $ex )
 {
     try {
         $result = $ex.Response.GetResponseStream()
