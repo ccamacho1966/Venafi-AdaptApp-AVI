@@ -2,7 +2,7 @@
 Adaptable application driver for Avi Networks (https://avinetworks.com/software-load-balancer/) - fork of Avi Networks developed original driver.
 
 ## Description
-This adaptable application uses Avi Network's API to discover and manage certificates linked to virtual services. This was forked from an earlier driver released by Avi Networks with bug fixes for proper filename discovery
+This adaptable application uses Avi Network's API to discover and manage certificates linked to virtual services. This was forked from an earlier driver released by Avi Networks with multiple bug fixes mostly related to discovery.
 
 ## Installation
 Upload the adaptable log driver file 'Avi-Networks.ps1' to all Venafi servers.
