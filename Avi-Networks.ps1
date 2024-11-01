@@ -38,7 +38,7 @@ Passwd|Not Used|000
 -----END FIELD DEFINITIONS-----
 #>
 
-$Script:AdaptableAppVer = "202205131716"
+$Script:AdaptableAppVer = "202404301045"
 $Script:AdaptableAppDrv = "Avi-Networks"
 
 # need the following to interface with an untrusted certificate
@@ -84,6 +84,9 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
 ##################################################################################################>
 function Prepare-KeyStore
 {
+    # This line tells VS Code to not flag this function's name as a "problem"
+    [Diagnostics.CodeAnalysis.SuppressMessage('PSUseApprovedVerbs', '', Justification='Forced by Venafi', Scope='function')]
+    
     Param(
         [Parameter(Mandatory=$true,HelpMessage="General Parameters")]
         [System.Collections.Hashtable]$General
@@ -110,6 +113,9 @@ function Prepare-KeyStore
 ##################################################################################################>
 function Generate-KeyPair
 {
+    # This line tells VS Code to not flag this function's name as a "problem"
+    [Diagnostics.CodeAnalysis.SuppressMessage('PSUseApprovedVerbs', '', Justification='Forced by Venafi', Scope='function')]
+    
     Param(
         [Parameter(Mandatory=$true,HelpMessage="General Parameters")]
         [System.Collections.Hashtable]$General,
@@ -141,6 +147,9 @@ function Generate-KeyPair
 ##################################################################################################>
 function Generate-CSR
 {
+    # This line tells VS Code to not flag this function's name as a "problem"
+    [Diagnostics.CodeAnalysis.SuppressMessage('PSUseApprovedVerbs', '', Justification='Forced by Venafi', Scope='function')]
+    
     Param(
         [Parameter(Mandatory=$true,HelpMessage="General Parameters")]
         [System.Collections.Hashtable]$General,
@@ -555,6 +564,9 @@ function Update-Binding
 ##################################################################################################>
 function Activate-Certificate
 {
+    # This line tells VS Code to not flag this function's name as a "problem"
+    [Diagnostics.CodeAnalysis.SuppressMessage('PSUseApprovedVerbs', '', Justification='Forced by Venafi', Scope='function')]
+    
     Param(
         [Parameter(Mandatory=$true,HelpMessage="General Parameters")]
         [System.Collections.Hashtable]$General
@@ -581,6 +593,9 @@ function Activate-Certificate
 ##################################################################################################>
 function Extract-Certificate
 {
+    # This line tells VS Code to not flag this function's name as a "problem"
+    [Diagnostics.CodeAnalysis.SuppressMessage('PSUseApprovedVerbs', '', Justification='Forced by Venafi', Scope='function')]
+    
     Param(
         [Parameter(Mandatory=$true,HelpMessage="General Parameters")]
         [System.Collections.Hashtable]$General
@@ -642,6 +657,9 @@ function Extract-Certificate
 ##################################################################################################>
 function Extract-PrivateKey
 {
+    # This line tells VS Code to not flag this function's name as a "problem"
+    [Diagnostics.CodeAnalysis.SuppressMessage('PSUseApprovedVerbs', '', Justification='Forced by Venafi', Scope='function')]
+    
     Param(
         [Parameter(Mandatory=$true,HelpMessage="General Parameters")]
         [System.Collections.Hashtable]$General,
@@ -670,7 +688,7 @@ function Extract-PrivateKey
             return @{ Result="Success"; PrivKeyPem="$pem" }
         }
         else {
-            Write-VenDebugLog "Export failed (Certificate '$()' not found) - Returning control to Venafi"
+            Write-VenDebugLog "Export failed (Certificate '$($General.AssetName)' not found) - Returning control to Venafi"
             throw "No certificate named '" + $General.AssetName + "' was found to export private key."
         }
     }
@@ -748,6 +766,9 @@ function Remove-Certificate
 ##################################################################################################>
 function Discover-Certificates
 {
+    # This line tells VS Code to not flag this function's name as a "problem"
+    [Diagnostics.CodeAnalysis.SuppressMessage('PSUseApprovedVerbs', '', Justification='Forced by Venafi', Scope='function')]
+    
     Param(
         [Parameter(Mandatory=$true,HelpMessage="General Parameters")]
         [System.Collections.Hashtable]$General
@@ -760,9 +781,9 @@ function Discover-Certificates
     $ref_content_map = @{}
     $results = @()
     $sitesTotal=$sitesSSL=$sitesClear=0
-    foreach($vs in $all_vs){
+    foreach ($vs in $all_vs) {
         $sitesTotal++
-        if($vs.ssl_key_and_certificate_refs){
+        if ($vs.ssl_key_and_certificate_refs) {
             $sitesSSL++
             $temp = @{}
 # modified - lookup the actual certificate filename so that it can be stored - otherwise validation won't work!
@@ -931,7 +952,7 @@ function Get-AviSession( [string] $addr, [string] $user, [string] $pass )
     Write-VenDebugLog "Logged into AVI controller [$($addr)] (Version $($x_avi_version)) as [$($user)]"
 	$session.Headers.Add([string] "X-Avi-Version", $x_avi_version)
 	$session.Headers.Add([string] "content-type", [string] "application/json")
-	$session.Headers.Add([string] "referer", [string] "https://$addr)")
+	$session.Headers.Add([string] "referer", [string] "https://$addr")
 	$session.Headers.Add([string] "x-csrftoken", $($session.Cookies.GetCookies("https://$addr")["csrftoken"].Value))
 	return $session
 }
