@@ -39,7 +39,7 @@ Passwd|Not Used|000
 -----END FIELD DEFINITIONS-----
 #>
 
-$Script:AdaptableAppVer = '202506261830'
+$Script:AdaptableAppVer = '202506271745'
 $Script:AdaptableAppDrv = 'Avi-Networks'
 
 # need the following to interface with an untrusted certificate
@@ -874,7 +874,7 @@ function Initialize-VenDebugLog
         [System.Collections.Hashtable] $General
     )
 
-    if ($null -ne $Script:venDebugFile) {
+    if ($Script:venDebugFile) {
         Write-VenDebugLog "Called by $((Get-PSCallStack)[1].Command)"
         Write-VenDebugLog 'WARNING: Initialize-VenDebugLog() called more than once!'
         return
@@ -918,6 +918,12 @@ function Invoke-AviRestApi
 
     Write-VenDebugLog "$((Get-PSCallStack)[1].Command)/$($Method): $($Uri)"
 
+    $Referer = $WebSession.Headers['Referer']
+    if (-not $Uri.IsAbsoluteUri) {
+        # Convert a relative path supplied by the API back into a full Uri
+        $Uri = ([System.Uri] ("https://$($Referer)$($Uri.OriginalString)"))
+    }
+
     $ApiRequest = @{
         'Uri'         = $Uri
         'Method'      = $Method
@@ -925,16 +931,11 @@ function Invoke-AviRestApi
         'ContentType' = 'application/json'
         'WebSession'  = $WebSession
     }
-    if ($Body) { $ApiRequest.Body = $Body }
-
-    $Referer = $WebSession.Headers['Referer']
-    if (-not $Uri.IsAbsoluteUri) {
-        # Convert a relative path supplied by the API back into a full Uri
-        $Uri = "https://$($Referer)$($Uri.OriginalString)"
-    }
+    if ($Headers) { $ApiRequest.Headers = $Headers }
+    if ($Body)    { $ApiRequest.Body    = $Body }
 
 	try {
-        $AviReply = Invoke-RestMethod @ApiRequest -Headers $Headers
+        $AviReply = Invoke-RestMethod @ApiRequest
         if ($WebSession.Headers['X-CSRFToken'] -ne $WebSession.Cookies.GetCookies($Referer)['csrftoken'].Value) {
             # Avi has updated the CSRF Token so we must update our headers or risk getting a 401 Unauthorized refusal
             Write-VenDebugLog "CSRF Token has been updated - Updating X-CSRFToken header"
