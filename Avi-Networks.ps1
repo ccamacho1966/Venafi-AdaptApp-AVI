@@ -1,16 +1,12 @@
 <#
 //----------------------------------------------------------------------- 
-// Avi Networks.ps1
+// Avi-Networks.ps1
 //
-// Copyright (c) 2017 Venafi, Inc.  All rights reserved. 
+// Original script developed by Avi Networks
+// Based on a sample script provided by Venafi
+// This version is maintained by Christopher Camacho
 //
-// This sample script and its contents are provided by Venafi to customers 
-// and authorized technology partners for the purposes of integrating with
-// services and platforms that are not owned or supported by Venafi.  Any 
-// sharing of this script or its contents without consent from Venafi is 
-// prohibited.
-//
-// This sample is provided "as is" without warranty of any kind.
+// This script is provided "as is" without warranty of any kind.
 //----------------------------------------------------------------------- 
 
 Modifications to Avi Networks driver coding:
@@ -19,6 +15,11 @@ Modifications to Avi Networks driver coding:
 - fix get-allvs to actually return more than 25 virtual services by supporting pagination ... another bad bug!
 - logging has been extensively overhauled to utilize better separation of logs, more useful log filenames,
 -- and an end to multiple discovery processes writing into the same logs which greatly reduces their usefulness.
+- reworked login and rest call functions to keep CSRF token properly updated
+- cleaned up header management to keep functions smaller and datasets consistent
+- extract certificate did not actually extract the in-use certificate therefore validation results could not
+-- be relied on. changes to the virtual service can easily be missed if the certificate on disk doesn't change
+-- as the only thing checked was the actual certificate file/entry. the virtual service was not checked at all.
 
 <field name>|<label text>|<flags>
 
@@ -38,8 +39,8 @@ Passwd|Not Used|000
 -----END FIELD DEFINITIONS-----
 #>
 
-$Script:AdaptableAppVer = "202404301045"
-$Script:AdaptableAppDrv = "Avi-Networks"
+$Script:AdaptableAppVer = '202506261830'
+$Script:AdaptableAppDrv = 'Avi-Networks'
 
 # need the following to interface with an untrusted certificate
 Add-Type -TypeDefinition @"
@@ -89,10 +90,10 @@ function Prepare-KeyStore
     
     Param(
         [Parameter(Mandatory=$true,HelpMessage="General Parameters")]
-        [System.Collections.Hashtable]$General
+        [System.Collections.Hashtable] $General
     )
 
-    return @{ Result="NotUsed"; }
+    return @{ Result='NotUsed' }
 }
 
 
@@ -118,12 +119,12 @@ function Generate-KeyPair
     
     Param(
         [Parameter(Mandatory=$true,HelpMessage="General Parameters")]
-        [System.Collections.Hashtable]$General,
+        [System.Collections.Hashtable] $General,
         [Parameter(Mandatory=$true,HelpMessage="Function Specific Parameters")]
-        [System.Collections.Hashtable]$Specific
+        [System.Collections.Hashtable] $Specific
     )
    
-    return @{ Result="NotUsed"; }
+    return @{ Result='NotUsed' }
 }
 
 
@@ -152,84 +153,64 @@ function Generate-CSR
     
     Param(
         [Parameter(Mandatory=$true,HelpMessage="General Parameters")]
-        [System.Collections.Hashtable]$General,
+        [System.Collections.Hashtable] $General,
         [Parameter(Mandatory=$true,HelpMessage="Function Specific Parameters")]
-        [System.Collections.Hashtable]$Specific
+        [System.Collections.Hashtable] $Specific
     )
 
-    Initialize-VenDebugLog -General $General
+    $General | Initialize-VenDebugLog
 
-	if ( -not $($Specific.SubjectDn.CN) ) {
+	if (-not $($Specific.SubjectDn.CN)) {
         throw "Common Name is required by Avi Vantage for remotely generated CSRs."
     }
-    else {
-        $subject = @{ "common_name"=$($Specific.SubjectDn.CN) }
-    }
 
-    if ( $Specific.SubjectDn.OU ) {
-        # only one OU is currently supported so we always use the first if there are many
-        $subject.Add( "organization_unit", $Specific.SubjectDn.OU[0] )
-    }
-
-    if ( $Specific.SubjectDn.O ) {
-        $subject.Add( "organization", $Specific.SubjectDn.O )
-    }
-
-    if ( $Specific.SubjectDn.L ) {
-        $subject.Add( "locality", $Specific.SubjectDn.L )
-    }
-
-    if ( $Specific.SubjectDn.ST ) {
-        $subject.Add( "state", $Specific.SubjectDn.ST )
-    }
-
-    if ( $Specific.SubjectDn.C ) {
-        $subject.Add( "country", $Specific.SubjectDn.C )
-    }
+    # Build the subject structure for a remotely generated CSR
+    $subject = @{ "common_name" = $($Specific.SubjectDn.CN) }
+    if ($Specific.SubjectDn.O)  { $subject.Add( "organization",      $Specific.SubjectDn.O )     }
+    # only one OU is currently supported so we always use the first if there are many
+    if ($Specific.SubjectDn.OU) { $subject.Add( "organization_unit", $Specific.SubjectDn.OU[0] ) }
+    if ($Specific.SubjectDn.L)  { $subject.Add( "locality",          $Specific.SubjectDn.L )     }
+    if ($Specific.SubjectDn.ST) { $subject.Add( "state",             $Specific.SubjectDn.ST )    }
+    if ($Specific.SubjectDn.C)  { $subject.Add( "country",           $Specific.SubjectDn.C )     }
 
     $sans_dns = @() + $($Specific.SubjAltNames.DNS | Where-Object {$_})  # an array of DNS Subject Alternative Names, possibly empty
 
-    try {
-        $session = Get-AviSession $General.HostAddress $General.UserName $General.UserPass
+    # Create an API session with the Avi controller
+    $AviSession = $General | New-AviApiSession
 
-        $headers = @{
-			"content-type"="application/json";
-			"referer"="https://$($General.HostAddress)";
-			"X-Avi-Tenant"=$General.VarText2;
-			"x-csrftoken"=$($session.Cookies.GetCookies("https://$($General.HostAddress)")["csrftoken"].Value)
+    $body = @{
+        "name"        = $General.AssetName;
+        "certificate" = @{
+            "self_signed"       = $false;
+            "subject"           = $subject;
+            "subject_alt_names" = $sans_dns;
+        };
+        "type"        = "SSL_CERTIFICATE_TYPE_VIRTUALSERVICE";
+        "key_params"  = @{
+            "algorithm"         = "SSL_KEY_ALGORITHM_RSA";
+            "rsa_params"        = @{ "key_size" = $("SSL_KEY_$($Specific.KeySize)_BITS") }
         }
+    } | ConvertTo-Json
 
-        [string] $url = "https://$($General.HostAddress)/api/sslkeyandcertificate"
-
-        $body = @{
-        	"name"=$General.AssetName;
-	        "certificate"=@{
-		        "self_signed"=$false;
-		        "subject"=$subject;
-                "subject_alt_names"=$sans_dns;
-	        };
-            "type"="SSL_CERTIFICATE_TYPE_VIRTUALSERVICE";
-            "key_params"=@{
-                "algorithm"="SSL_KEY_ALGORITHM_RSA";
-                "rsa_params"=@{
-                    "key_size"=$("SSL_KEY_" + $Specific.KeySize + "_BITS")
-                }
-            }
-        } | ConvertTo-Json
-
+    try {
         Write-VenDebugLog "Creating new remotely generated CSR for '$($General.AssetName)'"
-        $resp_obj = Invoke-AviRestMethod -Uri $url -Method Post -Headers $headers -Body $body -ContentType "application/json" -WebSession $session
-		$csr_uuid = $resp_obj.response.uuid
-        Write-VenDebugLog "New CSR created (CSR UUID: $($csr_uuid))"
-		[string] $url = "https://$($General.HostAddress)/api/sslkeyandcertificate/$csr_uuid"
-		$resp_obj = Invoke-AviRestMethod -Uri $url -Method Get -Headers $headers -ContentType "application/json" -WebSession $session
-        $csr = $resp_obj.response.certificate.certificate_signing_request
-        Write-VenDebugLog 'Returning control to Venafi'
+        $url = "https://$($General.HostAddress)/api/sslkeyandcertificate"
+        $AviReply = Invoke-AviRestApi -Uri $url -Method Post -Body $body -WebSession $AviSession
+        $CsrUuid  = $AviReply.uuid
 
-        return @{ Result="Success"; Pkcs10=$csr }
+        Write-VenDebugLog "Downloading CSR from Avi controller (UUID: $($CsrUuid))"
+        $url = "https://$($General.HostAddress)/api/sslkeyandcertificate/$($CsrUuid)"
+        $AviReply = Invoke-AviRestApi -Uri $url -Method Get -WebSession $AviSession
+    } catch {
+        Write-VenDebugLog "API ERROR (Generate CSR): $(Select-ErrorMessage($_.Exception))" -ThrowException
     }
-    catch {
-        throw Select-ErrorMessage($_.Exception)
+
+    Write-VenDebugLog 'Returning control to Venafi'
+    $CsrText  = $AviReply.certificate.certificate_signing_request
+
+    return @{
+        Result = 'Success'
+        Pkcs10 = $CsrText
     }
 }
 
@@ -253,86 +234,70 @@ function Install-Chain
 {
     Param(
         [Parameter(Mandatory=$true,HelpMessage="General Parameters")]
-        [System.Collections.Hashtable]$General,
+        [System.Collections.Hashtable] $General,
         [Parameter(Mandatory=$true,HelpMessage="Function Specific Parameters")]
-        [System.Collections.Hashtable]$Specific
+        [System.Collections.Hashtable] $Specific
     )
 
-    Initialize-VenDebugLog -General $General
+    $General | Initialize-VenDebugLog
 
-    try
-    {
-        $session = Get-AviSession $General.HostAddress $General.UserName $General.UserPass
-        $headers = @{
-			"content-type"="application/json";
-			"referer"="https://$($General.HostAddress)";
-			"X-Avi-Tenant"=$General.VarText2;
-			"x-csrftoken"=$($session.Cookies.GetCookies("https://$($General.HostAddress)")["csrftoken"].Value)
-        }
-        if ( $Specific.ChainPkcs7 )
-        {
-            $chain = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2Collection
-            $chain.Import( $Specific.ChainPkcs7 )
-            foreach ( $cert in $chain )
-            {
-                $is_installed = $false
-                $cacert_name = $cacert_basename = Get-CACertName $cert
-				for ( $i=0; $i -lt 10; $i++ ) 
-                {
-                    Write-VenDebugLog "Preparing to upload CA certificate: [$($cacert_name)]"
-					# check to see if a certificate already exists by the name
-                    $url = "https://$($General.HostAddress)/api/sslkeyandcertificate?name=$cacert_name&export_key=false"
-					$resp_obj = Invoke-AviRestMethod -Uri $url -Method Get -Headers $headers -ContentType "application/json" -WebSession $session
-                    $response = $resp_obj.response
-					if ( $response.Count -ne 0 ) # name collision, is it the same cert?
-                    {
-						$pem = $response.results.certificate.certificate
-                        $pem = $pem.Replace("-----BEGIN CERTIFICATE-----","").Replace("-----END CERTIFICATE-----","")
-                        $cert_existing = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2
-                        $cert_existing.Import([Convert]::FromBase64String($pem))
-                        if ( $cert_existing.Equals($cert) ) # this certificate is already installed
-                        {
-                            Write-VenDebugLog "CA certificate '$($cacert_name)' has already been installed."
-                            $is_installed = $true
-							break
-                        }
-                        else # append an integer and test that name for uniqueness
-                        {
-                            Write-VenDebugLog "CA certificate '$($cacert_name)' exists, but does not match!"
-                            $cacert_name = $cacert_basename + "_" + $idx
-                        }
-                    }
-                    else # install the CA certificate
-                    {
-                        $pem = [Convert]::ToBase64String($cert.RawData, [System.Base64FormattingOptions]::InsertLineBreaks)
-                        $url = "https://$($General.HostAddress)/api/sslkeyandcertificate"
-                        $body = @{
-                            "certificate"=@{
-                                "certificate"="-----BEGIN CERTIFICATE-----`n$pem`n-----END CERTIFICATE-----"
-                            };
-                            "name"=$cacert_name;
-                            "type"="SSL_CERTIFICATE_TYPE_CA"
-                        } | ConvertTo-Json
-                        Invoke-AviRestMethod -Uri $url -Method Post -Headers $headers -Body $body -ContentType "application/json" -WebSession $session
-                        Write-VenDebugLog "CA certificate '$($cacert_name)' has been uploaded."
+    # Create an API session with the Avi controller
+    $AviSession = $General | New-AviApiSession
+
+    try {
+        $chain = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2Collection
+        $chain.Import($Specific.ChainPkcs7)
+        foreach ($cert in $chain) {
+            $is_installed = $false
+            $cacert_name = $cacert_basename = ($cert | Get-CACertName)
+            for ($i=0; $i -lt 10; $i++) {
+                Write-VenDebugLog "Preparing to upload CA certificate: [$($cacert_name)]"
+
+                # check to see if a certificate already exists by the name
+                $url = "https://$($General.HostAddress)/api/sslkeyandcertificate?name=$($cacert_name)&export_key=false"
+                $AviReply = Invoke-AviRestApi -Uri $url -Method Get -WebSession $AviSession
+
+                if ($AviReply.Count -ne 0) {
+                    # name collision, is it the same cert?
+                    $pem = ($AviReply.results.certificate.certificate).Replace("-----BEGIN CERTIFICATE-----","").Replace("-----END CERTIFICATE-----","")
+                    $cert_existing = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2
+                    $cert_existing.Import([Convert]::FromBase64String($pem))
+
+                    if ($cert_existing.Equals($cert)) {
+                        # This certificate is already installed
+                        Write-VenDebugLog "CA certificate '$($cacert_name)' has already been installed."
                         $is_installed = $true
                         break
+                    } else {
+                        # append an integer and test that name for uniqueness
+                        Write-VenDebugLog "CA certificate '$($cacert_name)' exists, but does not match!"
+                        $cacert_name = "$($cacert_basename)_$($idx)"
                     }
-                }
-                if ( -not $is_installed )
-                {
-                    Write-VenDebugLog "Conflict resolution failed for '$($cacert_basename)'"
-                    throw "Automatic name conflict resolution threshold was exceeded for '" + $cacert_basename + "'"
+                } else {
+                    # install the CA certificate
+                    $pem = [Convert]::ToBase64String($cert.RawData, [System.Base64FormattingOptions]::InsertLineBreaks)
+                    $url = "https://$($General.HostAddress)/api/sslkeyandcertificate"
+                    $body = @{
+                        "certificate" = @{ "certificate"="-----BEGIN CERTIFICATE-----`n$($pem)`n-----END CERTIFICATE-----" }
+                        "name"        = $cacert_name
+                        "type"        = "SSL_CERTIFICATE_TYPE_CA"
+                    } | ConvertTo-Json
+                    Invoke-AviRestApi -Uri $url -Method Post -Body $body -WebSession $AviSession | Out-Null
+                    Write-VenDebugLog "CA certificate '$($cacert_name)' has been uploaded."
+                    $is_installed = $true
+                    break
                 }
             }
+            if (-not $is_installed) {
+                "Automatic name conflict resolution threshold was exceeded for '$($cacert_basename)'" | Write-VenDebugLog -ThrowException
+            }
         }
-        Write-VenDebugLog "CA chain installed - Returning control to Venafi"
-        return @{ Result="Success"; }
-    }
-    catch
-    {
+    } catch {
         throw Select-ErrorMessage($_.Exception)
     }
+
+    Write-VenDebugLog 'CA chain installed - Returning control to Venafi'
+    return @{ Result='Success' }
 }
 
 
@@ -357,12 +322,12 @@ function Install-PrivateKey
 {
     Param(
         [Parameter(Mandatory=$true,HelpMessage="General Parameters")]
-        [System.Collections.Hashtable]$General,
+        [System.Collections.Hashtable] $General,
         [Parameter(Mandatory=$true,HelpMessage="Function Specific Parameters")]
-        [System.Collections.Hashtable]$Specific
+        [System.Collections.Hashtable] $Specific
     )
 
-    return @{ Result="NotUsed" }
+    return @{ Result='NotUsed' }
 }
 
 
@@ -392,97 +357,82 @@ function Install-Certificate
 {
     Param(
         [Parameter(Mandatory=$true,HelpMessage="General Parameters")]
-        [System.Collections.Hashtable]$General,
+        [System.Collections.Hashtable] $General,
         [Parameter(Mandatory=$true,HelpMessage="Function Specific Parameters")]
-        [System.Collections.Hashtable]$Specific
+        [System.Collections.Hashtable] $Specific
     )
 
-    Initialize-VenDebugLog -General $General
+    $General | Initialize-VenDebugLog
+
+    # Create an API session with the Avi controller
+    $AviSession = $General | New-AviApiSession
 
     try {
-        $session = Get-AviSession $General.HostAddress $General.UserName $General.UserPass
-        $cert = $Specific.CertPem
-        $key = $Specific.PrivKeyPem
-        $headers = @{
-			"content-type"="application/json";
-			"referer"="https://$($General.HostAddress)";
-            "X-Avi-Tenant"=$General.VarText2;
-			"x-csrftoken"=$($session.Cookies.GetCookies("https://$($General.HostAddress)")["csrftoken"].Value)
-        }
         Write-VenDebugLog "Preparing to upload certificate: [$($General.AssetName)]"
-        if ( $key ) # this is central generation
-        {
-            # check to see if a certificate already exists by the name
+
+        $cert = $Specific.CertPem
+        $key  = $Specific.PrivKeyPem
+        if ($key) { # this is central generation
+            # Check to see if a certificate already exists by the name
             $url = "https://$($General.HostAddress)/api/sslkeyandcertificate?name=$($General.AssetName)&export_key=false"
-			$resp_obj = Invoke-AviRestMethod -Uri $url -Method Get -Headers $headers -ContentType "application/json" -WebSession $session
-			$response = $resp_obj.response
-            if ( $response.Count -ne 0 ) # name collision, is it the same cert?
-            {
+            $AviReply = Invoke-AviRestApi -Uri $url -Method Get -WebSession $AviSession
+
+            if ($AviReply.Count) { # name collision, is it the same cert?
                 $pem = $cert.Replace("-----BEGIN CERTIFICATE-----","").Replace("-----END CERTIFICATE-----","")
                 $cert_installing = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2
                 $cert_installing.Import([Convert]::FromBase64String($pem))
-                $pem = $response.results.certificate.certificate
+
+                $pem = $AviReply.results.certificate.certificate
                 $pem = $pem.Replace("-----BEGIN CERTIFICATE-----","").Replace("-----END CERTIFICATE-----","")
                 $cert_existing = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2
                 $cert_existing.Import([Convert]::FromBase64String($pem))
-                if ( $cert_existing.Equals($cert_installing) ) # this certificate is already installed
-                {
-                    Write-VenDebugLog "Certificate is already installed - Returning control to Venafi"
-                    return @{ Result="AlreadyInstalled"; }
-                }
-                else {
-                    Write-VenDebugLog "ERROR: A different certificate is installed as '$($General.AssetName)' - Returning control to Venafi"
-                    throw "A different certificate already exists with the name '" + $General.AssetName + "'"
+
+                if ($cert_existing.Equals($cert_installing)) { # Are these the same certificate?
+                    Write-VenDebugLog 'Certificate is already installed - Returning control to Venafi'
+                    return @{ Result='AlreadyInstalled' }
+                } else {
+                    "A different certificate already exists with the name '$($General.AssetName)'" | Write-VenDebugLog -ThrowException
                 }
             }
+
             $url = "https://$($General.HostAddress)/api/sslkeyandcertificate"            
             $body = @{
-	            "certificate"=@{
-		            "certificate"=$cert;
-	            };
-                "key"=$key;
-	            "name"=$General.AssetName;
-                "type"="SSL_CERTIFICATE_TYPE_VIRTUALSERVICE"
+	            "certificate" = @{ "certificate" = $cert }
+                "key"         = $key
+	            "name"        = $General.AssetName
+                "type"        = 'SSL_CERTIFICATE_TYPE_VIRTUALSERVICE'
             } | ConvertTo-Json
-            # Note: this call requires the x-csrftoken HTTP header to avoid (401) Unauthorized
-            Invoke-AviRestMethod -Uri $url -Method Post -Headers $headers -Body $body -ContentType "application/json" -WebSession $session
+
+            # Upload the certificate
+            Invoke-AviRestApi -Uri $url -Method Post -Body $body -WebSession $AviSession | Out-Null
             Write-VenDebugLog "Certificate has been uploaded as '$($General.AssetName)' - Returning control to Venafi"
-            return @{ Result="Success"; }
-        }
-        else # this is remote generation
-        {
-            # lookup the CSR
+        } else { # this is remote generation
+            # Lookup the CSR
             Write-VenDebugLog "Searching for remotely generated CSR for '$($General.AssetName)'"
             $url = "https://$($General.HostAddress)/api/sslkeyandcertificate?name=$($General.AssetName)&export_key=false"
-			$resp_obj = Invoke-AviRestMethod -Uri $url -Method Get -Headers $headers -ContentType "application/json" -WebSession $session
-			$response = $resp_obj.response
-            if ( $response.Count -ne 0 ) # found it
-            {
-                if ( -not $response.results.certificate.certificate ) {
-                    # install the certificate
-                    $url = $response.results.url
-					$response.results.certificate | Add-Member -MemberType NoteProperty -Name 'certificate' -Value $cert
-                    $body = $response.results | ConvertTo-Json
+            $AviReply = Invoke-AviRestApi -Uri $url -Method Get -WebSession $AviSession
 
-                    # Note: this call requires the x-csrftoken HTTP header to avoid (401) Unauthorized
-                    Invoke-AviRestMethod -Uri $url -Method Put -Headers $headers -Body $body -ContentType "application/json" -WebSession $session
+            if ($AviReply.Count) { # found it
+                if (-not $AviReply.results.certificate.certificate) {
+                    # install the certificate
+                    $url = $AviReply.results.url
+					$AviReply.results.certificate | Add-Member -MemberType NoteProperty -Name 'certificate' -Value $cert
+                    $body = $AviReply.results | ConvertTo-Json
+                    Invoke-AviRestApi -Uri $url -Method Put -Body $body -WebSession $AviSession | Out-Null
+
                     Write-VenDebugLog "Certificate has been uploaded as '$($General.AssetName)' - Returning control to Venafi"
-                    return @{ Result="Success"; }
+                } else {
+                    "A different certificate is already installed as '$($General.AssetName)'" | Write-VenDebugLog -ThrowException
                 }
-                else {
-                    Write-VenDebugLog "ERROR: A different certificate is installed as '$($General.AssetName)' - Returning control to Venafi"
-                    throw "A certificate is unexpectedly already installed on '" + $General.AssetName + "'"
-                }
-            }
-            else {
-                Write-VenDebugLog "ERROR: Remotely generated CSR not found for '$($General.AssetName)'"
-                throw "Remotely generated CSR was not found with name '" + $General.AssetName + "'"
+            } else {
+                "Remotely generated CSR was not found for '$($General.AssetName)'" | Write-VenDebugLog -ThrowException
             }
         }
+    } catch {
+        "Unexpected Error: $(Select-ErrorMessage($_.Exception))" | Write-VenDebugLog -ThrowException
     }
-    catch {
-        throw Select-ErrorMessage($_.Exception)
-    }
+
+    return @{ Result='Success' }
 }
 
 
@@ -501,54 +451,66 @@ function Update-Binding
 {
     Param(
         [Parameter(Mandatory=$true,HelpMessage="General Parameters")]
-        [System.Collections.Hashtable]$General
+        [System.Collections.Hashtable] $General
     )
 
-    Initialize-VenDebugLog -General $General
+    $General | Initialize-VenDebugLog
 
-    $session = Get-AviSession $General.HostAddress $General.UserName $General.UserPass
-	$tenant_name = $General.VarText2
-    $headers = @{
-		"content-type"="application/json";
-		"referer"="https://$($General.HostAddress)";
-		"X-Avi-Tenant"=$tenant_name;
-		"x-csrftoken"=$($session.Cookies.GetCookies("https://$($General.HostAddress)")["csrftoken"].Value)
+    # Create an API session with the Avi controller
+    $AviSession = $General | New-AviApiSession
+
+    $VirtualServiceName = $General.VarText1
+
+    # Get Virtual Service Configuration
+    Write-VenDebugLog "Retrieving configuration for Virtual Service '$($VirtualServiceName)'"
+    try {
+        $url = "https://$($General.HostAddress)/api/virtualservice?name=$($VirtualServiceName)"
+        $AviReply = Invoke-AviRestApi -Uri $url -Method Get -WebSession $AviSession
+    } catch {
+        "API ERROR (Find Virtual Service): $(Select-ErrorMessage($_.Exception))" | Write-VenDebugLog -ThrowException
     }
-	$vs_name = $General.VarText1
-    # Get Virtual Service UUID
-    $url = "https://$($General.HostAddress)/api/virtualservice?name={0}" -f $vs_name
-    Write-VenDebugLog "Retrieving configuration for virtual service '$($vs_name)'"
-	$resp_obj = Invoke-AviRestMethod -Uri $url -Method Get -Headers $headers -WebSession $session
-	$resp_vs = $resp_obj.response
-	if ($resp_vs.count -eq 0) {
-        Write-VenDebugLog "Could not find virtual service '$($vs_name)'"
-		throw "Could not find virtual service '$($vs_name)'"
-	}
-	$vs_uuid = $resp_vs.results[0].uuid
-   
-    # Get Certificate UUID
-	$cert_avi_name = $General.AssetName
-    $url = "https://$($General.HostAddress)/api/sslkeyandcertificate?name={0}" -f $cert_avi_name
-	$resp_obj = Invoke-AviRestMethod -Uri $url -Method Get -Headers $headers -WebSession $session
-	$resp = $resp_obj.response
-	if($resp.count -eq 0) {
-        Write-VenDebugLog "Certificate '$($cert_avi_name)' not found!"
-		throw "Certificate '$($cert_avi_name)' not found!"
-	}
-    $cert_uuid = $resp.results[0].url
- 
-    # Associate certificate with virtual service instance
-    $url = "https://$($General.HostAddress)/api/virtualservice/" + $vs_uuid
-   
-    $body = $resp_vs.results[0]
-    $body.ssl_key_and_certificate_refs=@( $cert_uuid ) 
-    $body = $body | ConvertTo-Json -depth 100
 
-    # Note: this call requires the x-csrftoken HTTP header to avoid (401) Unauthorized
-    Write-VenDebugLog "Binding certificate '$($cert_avi_name)' to virtual service '$($vs_name)'"
-	Invoke-AviRestMethod -Uri $url -Method Put -Headers $headers -Body $body -ContentType "application/json" -WebSession $session
-    Write-VenDebugLog "Virtual service has been updated - Returning control to Venafi"
-    return @{ Result="Success"; }
+    if (-not $AviReply.Count) {
+        # Virtual Service was not found
+        "Virtual Service '$($VirtualServiceName)' was not found." | Write-VenDebugLog -ThrowException
+    }
+
+    # Save the existing Virtual Service configuration for later
+    $VirtualServiceConfig = $AviReply.results[0]
+    $VirtualServiceUUID   = $VirtualServiceConfig.uuid
+
+    Write-VenDebugLog "Looking up certificate file '$($General.AssetName)'"
+    try {
+        # Search the Avi controller for the Certificate UUID
+        $url = "https://$($General.HostAddress)/api/sslkeyandcertificate?name=$($General.AssetName)"
+        $AviReply = Invoke-AviRestApi -Uri $url -Method Get -WebSession $AviSession
+    } catch {
+        "API ERROR (Find Certificate): $(Select-ErrorMessage($_.Exception))" | Write-VenDebugLog -ThrowException
+    }
+
+    if (-not $AviReply.Count) {
+        # Certificate was not found
+        "Certificate with asset name '$($General.AssetName)' was not found." | Write-VenDebugLog -ThrowException
+    }
+
+    $CertificateRef = $AviReply.results[0].url
+
+    # Create the updated configuration structure
+    $body = $VirtualServiceConfig
+    $body.ssl_key_and_certificate_refs = @( $CertificateRef )
+    $body = $body | ConvertTo-Json -Depth 100
+
+    Write-VenDebugLog "Binding certificate '$($General.AssetName)' to virtual service '$($VirtualServiceName)'"
+    try {
+        # Associate certificate with virtual service instance
+        $url = "https://$($General.HostAddress)/api/virtualservice/$($VirtualServiceUUID)"
+        Invoke-AviRestApi -Uri $url -Method Put -Body $body -WebSession $AviSession | Out-Null
+    } catch {
+        "API ERROR (Update Virtual Service): $(Select-ErrorMessage($_.Exception))" | Write-VenDebugLog -ThrowException
+    }
+
+    Write-VenDebugLog "Virtual Service has been updated - Returning control to Venafi"
+    return @{ Result='Success' }
 }
 
 <##################################################################################################
@@ -569,10 +531,10 @@ function Activate-Certificate
     
     Param(
         [Parameter(Mandatory=$true,HelpMessage="General Parameters")]
-        [System.Collections.Hashtable]$General
+        [System.Collections.Hashtable] $General
     )
     
-    return @{ Result="NotUsed"; }
+    return @{ Result='NotUsed' }
 }
 
 
@@ -598,44 +560,79 @@ function Extract-Certificate
     
     Param(
         [Parameter(Mandatory=$true,HelpMessage="General Parameters")]
-        [System.Collections.Hashtable]$General
+        [System.Collections.Hashtable] $General
     )
 
-    Initialize-VenDebugLog -General $General
+    # The original logic in use for this function was wrong on a fundamental level.
+    # It only checked to see if the file existed and returned its contents.
+    # It did not validate the actual VS configuration or return the actual certificate in use.
+    # This defeats the entire intent of doing proper installation validation.
+    #
+    # Issue originally reported by Van Dunn on 26-June-2025
 
+    $General | Initialize-VenDebugLog
+
+    # Create an API session with the Avi controller
+    $AviSession = $General | New-AviApiSession
+
+    # Pull the Virtual Service configuration
+    $VirtualServiceName = $General.VarText1
+    Write-VenDebugLog "Retrieving configuration for Virtual Service '$($VirtualServiceName)'"
     try {
-		$session = Get-AviSession $General.HostAddress $General.UserName $General.UserPass
-		$headers = @{
-			"content-type"="application/json";
-			"referer"="https://$($General.HostAddress)";
-			"X-Avi-Tenant"=$General.VarText2;
-			"x-csrftoken"=$($session.Cookies.GetCookies("https://$($General.HostAddress)")["csrftoken"].Value)
-		}
-        $url = "https://$($General.HostAddress)/api/sslkeyandcertificate?name=$($General.AssetName)&export_key=false"
-        $resp_obj = Invoke-AviRestMethod -Uri $url -Method Get -Headers $headers -ContentType "application/json" -WebSession $session
-		$response = $resp_obj.response
-        if ( $response.Count -ne 0 ) # certificate exists
-        {
-			$pem = $response.results.certificate.certificate
-            $idx = $response.results.certificate.fingerprint.IndexOf('=')
-            $thumbprint = $response.results.certificate.fingerprint.Remove(0,$idx+1).Replace(":","").ToLower().Trim()
-            $serial = "{0:x}" -f [bigint]$($response.results.certificate.serial_number)
-            Write-VenDebugLog "Certificate Asset Name:    $($General.AssetName)"
-            Write-VenDebugLog "Certificate Serial Number: $($serial)"
-            Write-VenDebugLog "Certificate Thumbprint:    $($thumbprint)"
-#            Write-VenDebugLog "Certificate Valid Until:   $()"
-            Write-VenDebugLog "Certificate extracted successfully - Returning control to Venafi"
-            return @{Result="Success"; CertPem="$pem"; Serial="$serial"; Thumprint="$thumbprint"}
-        }
-        else {
-            Write-VenDebugLog "NOT FOUND: Certificate with asset name $($General.AssetName) - Returning control to Venafi"
-            throw "No certificate named '" + $General.AssetName + "' was found."
-        }
+        # Search the Avi controller for the Virtual Service
+        $url = "https://$($General.HostAddress)/api/virtualservice?name=$($VirtualServiceName)"
+        $AviReply = Invoke-AviRestApi -Uri $url -Method Get -WebSession $AviSession
+    } catch {
+        "API ERROR (Find Virtual Service): $(Select-ErrorMessage($_.Exception))" | Write-VenDebugLog -ThrowException
     }
-    catch {
-        Write-VenDebugLog "API error: $($_.Exception)"
-        Write-VenDebugLog "FAILED to extract certificate - Returning control to Venafi"
-        throw Select-ErrorMessage($_.Exception)
+
+    if (-not $AviReply.Count) {
+        "Virtual Service '$($VirtualServiceName)' was not found." | Write-VenDebugLog -ThrowException
+    }
+
+    # Save the existing Virtual Service configuration for later
+    $VirtualServiceConfig = $AviReply.results[0]
+
+    # Confirm the Virtual Service is encrypted. If not, throw a failure.
+    if (-not $VirtualServiceConfig.ssl_key_and_certificate_refs) {
+        "Virtual Service '$($VirtualServiceName)' does not have a certificate defined (unencrypted)" | Write-VenDebugLog -ThrowException
+    }
+
+    Write-VenDebugLog "Retrieving certificate for Virtual Service '$($VirtualServiceName)'"
+    # Pull the Public Certificate attached to the Virtual Service
+    try {
+        $AviReply = Invoke-AviRestApi -Uri $VirtualServiceConfig.ssl_key_and_certificate_refs[0] -Method Get -WebSession $AviSession
+    } catch {
+        "API ERROR (Extract Certificate): $(Select-ErrorMessage($_.Exception))" | Write-VenDebugLog -ThrowException
+    }
+
+    if (-not $AviReply.certificate) {
+        "Certificate for Virtual Service '$($VirtualServiceName)' was not found." | Write-VenDebugLog -ThrowException
+    }
+
+    $CertFileName = $AviReply.name
+    $CertInUse    = $AviReply.certificate
+    $PEM          = $CertInUse.certificate
+    $idx          = $CertInUse.fingerprint.IndexOf('=')
+    $Thumbprint   = $CertInUse.fingerprint.Remove(0,$idx+1).Replace(":","").ToLower().Trim()
+    $SerialNumber = "{0:x}" -f [bigint]$($CertInUse.serial_number)
+
+    if ($CertFileName -ne $General.AssetName) {
+        Write-VenDebugLog "WARNING: Expected filename '$($General.AssetName)' but got filename '$($CertFileName)' instead"
+    }
+
+    # Return the public certificate, thumbprint, and serial number for the certificate actually in use
+    Write-VenDebugLog "Certificate Asset Name:    $($General.AssetName)"
+    Write-VenDebugLog "Certificate Serial Number: $($SerialNumber)"
+    Write-VenDebugLog "Certificate Thumbprint:    $($Thumbprint)"
+    Write-VenDebugLog "Certificate Valid Until:   $($CertInUse.not_after) UTC"
+
+    Write-VenDebugLog "Certificate extracted successfully - Returning control to Venafi"
+    return @{
+        Result     = 'Success'
+        CertPem    = $PEM
+        Serial     = $SerialNumber
+        Thumbprint = $Thumbprint
     }
 }
 
@@ -662,38 +659,36 @@ function Extract-PrivateKey
     
     Param(
         [Parameter(Mandatory=$true,HelpMessage="General Parameters")]
-        [System.Collections.Hashtable]$General,
+        [System.Collections.Hashtable] $General,
         [Parameter(Mandatory=$true,HelpMessage="Function Specific Parameters")]
-        [System.Collections.Hashtable]$Specific
+        [System.Collections.Hashtable] $Specific
     )
 
-    Initialize-VenDebugLog -General $General
+    $General | Initialize-VenDebugLog
+
+    # Create an API session with the Avi controller
+    $AviSession = $General | New-AviApiSession
 
     try {
-		$session = Get-AviSession $General.HostAddress $General.UserName $General.UserPass
-		$tenant_name = $General.VarText2
-		$headers = @{
-			"content-type"="application/json";
-			"referer"="https://$($General.HostAddress)";
-			"X-Avi-Tenant"=$tenant_name;
-			"x-csrftoken"=$($session.Cookies.GetCookies("https://$($General.HostAddress)")["csrftoken"].Value)
-		}
+        # Search the Avi controller for the certificate
         $url = "https://$($General.HostAddress)/api/sslkeyandcertificate?name=$($General.AssetName)&export_key=true"
-        $resp_obj = Invoke-AviRestMethod -Uri $url -Method Get -Headers $headers -ContentType "application/json" -WebSession $session
-		$response = $resp_obj.response
-        if ( $response.Count -ne 0 ) # certificate and private key exist
-        {
-            Write-VenDebugLog "Private key found for certificate '$($General.AssetName)' - Returning control to Venafi"
-            $pem = $response.results.key
-            return @{ Result="Success"; PrivKeyPem="$pem" }
-        }
-        else {
-            Write-VenDebugLog "Export failed (Certificate '$($General.AssetName)' not found) - Returning control to Venafi"
-            throw "No certificate named '" + $General.AssetName + "' was found to export private key."
-        }
+        $AviReply = Invoke-AviRestApi -Uri $url -Method Get -WebSession $AviSession
+    } catch {
+        "API ERROR (Extract Private Key): $(Select-ErrorMessage($_.Exception))" | Write-VenDebugLog -ThrowException
     }
-    catch {
-        throw Select-ErrorMessage($_.Exception)
+
+    if (-not $AviReply.Count) {
+        # Private key for certificate was not found
+        "Private key for certificate with asset name '$($General.AssetName)' was not found" | Write-VenDebugLog -ThrowException
+    }
+
+    # Private key for certificate has been found - Parse results and return data to Venafi
+    $PrivateKey = $AviReply.results.key
+
+    Write-VenDebugLog "Private key extracted successfully - Returning control to Venafi"
+    return @{
+        Result        = 'Success'
+        PrivateKeyPem = $PrivateKey
     }
 }
 
@@ -717,37 +712,41 @@ function Remove-Certificate
 {
     Param(
         [Parameter(Mandatory=$true,HelpMessage="General Parameters")]
-        [System.Collections.Hashtable]$General,
+        [System.Collections.Hashtable] $General,
         [Parameter(Mandatory=$true,HelpMessage="Function Specific Parameters")]
-        [System.Collections.Hashtable]$Specific
+        [System.Collections.Hashtable] $Specific
     )
 
-    Initialize-VenDebugLog -General $General
+    $General | Initialize-VenDebugLog
 
-	$cert_avi_name = $Specific.AssetNameOld
-	$session = Get-AviSession $General.HostAddress $General.UserName $General.UserPass
-	$tenant_name = $General.VarText2
-    $headers = @{
-		"content-type"="application/json";
-		"referer"="https://$($General.HostAddress)";
-		"X-Avi-Tenant"=$tenant_name;
-		"x-csrftoken"=$($session.Cookies.GetCookies("https://$($General.HostAddress)")["csrftoken"].Value)
+    # Create an API session with the Avi controller
+    $AviSession = $General | New-AviApiSession
+
+    Write-VenDebugLog "Checking for old certificate '$($Specific.AssetNameOld)'"
+    try {
+        # Search the Avi controller for the certificate
+        $url = "https://$($General.HostAddress)/api/sslkeyandcertificate?name=$($Specific.AssetNameOld)&export_key=false"
+        $AviReply = Invoke-AviRestApi -Uri $url -Method Get -WebSession $AviSession
+    } catch {
+        "API ERROR (Extract Certificate): $(Select-ErrorMessage($_.Exception))" | Write-VenDebugLog -ThrowException
     }
-    $url = "https://$($General.HostAddress)/api/sslkeyandcertificate?name=$($Specific.AssetNameOld)&export_key=false"
-    Write-VenDebugLog "Checking for old certificate '$($cert_avi_name)'"
-	$resp_obj = Invoke-AviRestMethod -Uri $url -Method Get -Headers $headers -ContentType "application/json" -WebSession $session
-	$response = $resp_obj.response
-    if ( $response.Count -ne 0 ) # certificate exists so try to delete it
-    {
-		$url = $response.results.url
-        Write-VenDebugLog "Found old certificate '$($cert_avi_name)' - Attempting to delete it"
-        Invoke-AviRestMethod -Uri $url -Method Delete -Headers $headers -WebSession $session
-        Write-VenDebugLog "Old certificate '$($cert_avi_name)' deleted - Returning control to Venafi"
+
+    if (-not $AviReply.Count) {
+        # Certificate was not found
+        Write-VenDebugLog "NOT FOUND: Certificate with asset name $($Specific.AssetNameOld) - Returning control to Venafi"
+    } else {
+        # Found the old certificate file - Try to delete it
+        Write-VenDebugLog "Found old certificate '$($Specific.AssetNameOld)' - Attempting to delete it"
+        try {
+            $url = $AviReply.results.url
+            Invoke-AviRestApi -Uri $url -Method Delete -WebSession $AviSession | Out-Null
+            Write-VenDebugLog "Old certificate '$($Specific.AssetNameOld)' deleted - Returning control to Venafi"
+        } catch {
+            Write-VenDebugLog "API ERROR (Delete Certificate): $(Select-ErrorMessage($_.Exception))"
+        }
     }
-	else {
-        Write-VenDebugLog "Old certificate '$($cert_avi_name)' not found"
-	}
-    return @{ Result="Success"; }
+
+    return @{ Result='Success' }
 }
 
 
@@ -771,50 +770,58 @@ function Discover-Certificates
     
     Param(
         [Parameter(Mandatory=$true,HelpMessage="General Parameters")]
-        [System.Collections.Hashtable]$General
+        [System.Collections.Hashtable] $General
     )
 
-    Initialize-VenDebugLog -General $General
+    $General | Initialize-VenDebugLog
 
-	$login_session = Get-AviSession $General.HostAddress $General.UserName $General.UserPass
-	$all_vs = Get-AllVS $General $login_session
+    # Create an API session with the Avi controller
+    $AviSession = $General | New-AviApiSession
+
+    $AllVirtualServices = Get-AviVirtualServices -WebSession $AviSession
+
     $ref_content_map = @{}
-    $results = @()
-    $sitesTotal=$sitesSSL=$sitesClear=0
-    foreach ($vs in $all_vs) {
+    $ApplicationList = @()
+    $sitesTotal = $sitesSSL = $sitesClear = 0
+    foreach ($vs in $AllVirtualServices) {
         $sitesTotal++
         if ($vs.ssl_key_and_certificate_refs) {
             $sitesSSL++
-            $temp = @{}
-# modified - lookup the actual certificate filename so that it can be stored - otherwise validation won't work!
-            $cert_filename = Get-Cert-Name-By-Ref $General $vs.ssl_key_and_certificate_refs[0] $ref_content_map $login_session
-# modified - replace bad naming convention to prevent collisions
-            $tenant_name = Get-Tenant-Name-By-Ref $General $vs.tenant_ref $ref_content_map $login_session
-            $vsIP = Get-IPv4-VIP $General $vs $login_session
+            $ThisApp = @{}
+
+            # Lookup the certificate filename so that it can be stored - otherwise validation won't work!
+            $CertificateFileName = Get-Cert-Name-By-Ref $General $vs.ssl_key_and_certificate_refs[0] $ref_content_map $AviSession
+
+            # Use Virtual Service name and Tenant name for Application name to prevent collisions
+            $TenantName = Get-Tenant-Name-By-Ref $General $vs.tenant_ref $ref_content_map $AviSession
+
+            $vsIP = Get-IPv4-VIP $General $vs $AviSession
             $vsPort = Get-SSL-Service-Port $vs
-            $temp["Name"] = "{0} ({1})" -f $vs.name, $tenant_name
-            $temp["ApplicationClass"] = "Adaptable App"
-            $temp["PEM"] = Get-Certificate-By-Ref $General $vs.ssl_key_and_certificate_refs[0] $ref_content_map $login_session
-            $temp["ValidationAddress"] = $vsIP
-            $temp["ValidationPort"] = $vsPort
-            $temp["Attributes"] = @{
+
+            # Build the application structure from collected results
+            $ThisApp["Name"] = "$($vs.name) ($($TenantName))"
+            $ThisApp["ApplicationClass"] = "Adaptable App"
+            $ThisApp["PEM"] = Get-Certificate-By-Ref $General $vs.ssl_key_and_certificate_refs[0] $ref_content_map $AviSession
+            $ThisApp["ValidationAddress"] = $vsIP
+            $ThisApp["ValidationPort"] = $vsPort
+            $ThisApp["Attributes"] = @{
                 "Text Field 1"= $vs.name;
-                "Text Field 2"= $tenant_name;
-# modified - insert required certificate filename so that validation actually works
-                "Certificate Name"= $cert_filename
+                "Text Field 2"= $TenantName;
+                "Certificate Name"= $CertificateFileName
             }
-            $results += $temp
-            Write-VenDebugLog "Discovered: [$($vs.name)] on tenant [$($tenant_name)] at $($vsIP):$($vsPort)"
-        }
-		else{
+            $ApplicationList += $ThisApp
+
+            Write-VenDebugLog "Discovered: [$($vs.name)] on tenant [$($TenantName)] at $($vsIP):$($vsPort)"
+        } else {
             $sitesClear++
             Write-VenDebugLog "Ignored: [$($vs.name)] is unencrypted"
 		}
     }
+
     Write-VenDebugLog "$($sitesTotal) virtual servers ($($sitesSSL) discovered, $($sitesClear) ignored) - Returning control to Venafi"
     return @{
-        Result="Success";
-        Applications = $results
+        Result       = 'Success'
+        Applications = $ApplicationList
     }
 }
 
@@ -828,24 +835,34 @@ function Discover-Certificates
 function Write-VenDebugLog
 {
     Param(
-        [Parameter(Position=0, Mandatory)][string]$LogMessage,
-        [switch]$NoFunctionTag
+        [Parameter(Position=0, ValueFromPipeline, Mandatory)]
+        [string] $LogMessage,
+
+        [Parameter()]
+        [switch] $ThrowException,
+
+        [Parameter()]
+        [switch] $NoFunctionTag
     )
 
     filter Add-TS {"$(Get-Date -Format o): $_"}
 
-    # if the logfile isn't initialized then do nothing and return immediately
-    if ($null -eq $Script:venDebugFile) { return }
+    # only write the log message to a file if the logfile is set...
+    if ($Script:venDebugFile) {
+        if ($NoFunctionTag.IsPresent) {
+            $taggedLog = $LogMessage
+        } else {
+            $taggedLog = "[$((Get-PSCallStack)[1].Command)] $($LogMessage)"
+        }
 
-    if ($NoFunctionTag.IsPresent) {
-        $taggedLog = $LogMessage
-    }
-    else {
-        $taggedLog = "[$((Get-PSCallStack)[1].Command)] $($LogMessage)"
+        # write the message to the debug file
+        Write-Output "$($taggedLog)" | Add-TS | Add-Content -Path $Script:venDebugFile
     }
 
-    # write the message to the debug file
-    Write-Output "$($taggedLog)" | Add-TS | Add-Content -Path $Script:venDebugFile
+    # throw the message as an exception, if requested
+    if ($ThrowException.IsPresent) {
+        throw $LogMessage
+    }
 }
 
 # Adding support for policy-level debug flag instead of forcing every app to be flagged
@@ -853,7 +870,8 @@ function Write-VenDebugLog
 function Initialize-VenDebugLog
 {
     Param(
-        [Parameter(Position=0, Mandatory)][System.Collections.Hashtable]$General
+        [Parameter(Position=0, Mandatory, ValueFromPipeline)]
+        [System.Collections.Hashtable] $General
     )
 
     if ($null -ne $Script:venDebugFile) {
@@ -862,13 +880,13 @@ function Initialize-VenDebugLog
         return
     }
 
-    if ($null -eq $DEBUG_FILE) {
+    if (-not $DEBUG_FILE) {
         # do nothing and return immediately if debug isn't on
         if ($General.VarBool1 -eq $false) { return }
+
         # pull Venafi base directory from registry for global debug flag
         $logPath = "$((Get-ItemProperty HKLM:\Software\Venafi\Platform).'Base Path')Logs"
-    }
-    else {
+    } else {
         # use the path but discard the filename from the DEBUG_FILE variable
         $logPath = "$(Split-Path -Path $DEBUG_FILE)"
     }
@@ -885,142 +903,188 @@ function Initialize-VenDebugLog
     Write-VenDebugLog -NoFunctionTag -LogMessage "PowerShell Environment: $($PSVersionTable.PSEdition) Edition, Version $($PSVersionTable.PSVersion.Major)"
 
     Write-VenDebugLog "Called by $((Get-PSCallStack)[1].Command)"
-
-#    Write-VenDebugLog 'GENERAL VARIABLES'
-#    $General.keys | %{ Add-Content -Path $Script:venDebugFile "$_ : $($General.$_)" }
 }
 
-function Invoke-AviRestMethod
+function Invoke-AviRestApi
 {
 	Param(
-		[Uri] $Uri,
+		[System.Uri] $Uri,
 		[Microsoft.PowerShell.Commands.WebRequestMethod] $Method,
 		[System.Object] $Body,
-		[string] $ContentType,
-		[string] $SessionVariable,
-		[int] $TimeoutSec,
+		[int] $TimeoutSec = 15,
 		[System.Collections.IDictionary] $Headers,
 		[Microsoft.PowerShell.Commands.WebRequestSession] $WebSession
 	)
+
     Write-VenDebugLog "$((Get-PSCallStack)[1].Command)/$($Method): $($Uri)"
+
+    $ApiRequest = @{
+        'Uri'         = $Uri
+        'Method'      = $Method
+        'TimeoutSec'  = $TimeoutSec
+        'ContentType' = 'application/json'
+        'WebSession'  = $WebSession
+    }
+    if ($Body) { $ApiRequest.Body = $Body }
+
+    $Referer = $WebSession.Headers['Referer']
+    if (-not $Uri.IsAbsoluteUri) {
+        # Convert a relative path supplied by the API back into a full Uri
+        $Uri = "https://$($Referer)$($Uri.OriginalString)"
+    }
+
 	try {
-		if($WebSession){
-			$response = Invoke-RestMethod -Uri $Uri -Method $Method -Headers $Headers -Body $Body -ContentType $ContentType -WebSession $WebSession -TimeoutSec $TimeoutSec
-			return @{
-				response=$response;
-				session=$WebSession;
-			}
-		}
-		if($SessionVariable){
-			$response = Invoke-RestMethod -Uri $Uri -Method $Method -Headers $Headers -Body $Body -ContentType $ContentType -SessionVariable new_session -TimeoutSec $TimeoutSec
-			return @{
-				response=$response;
-				session=$new_session
-			}
-		}
-	}
-	catch [System.Net.WebException] {
+        $AviReply = Invoke-RestMethod @ApiRequest -Headers $Headers
+        if ($WebSession.Headers['X-CSRFToken'] -ne $WebSession.Cookies.GetCookies($Referer)['csrftoken'].Value) {
+            # Avi has updated the CSRF Token so we must update our headers or risk getting a 401 Unauthorized refusal
+            Write-VenDebugLog "CSRF Token has been updated - Updating X-CSRFToken header"
+            $WebSession.Headers['X-CSRFToken']  =  $WebSession.Cookies.GetCookies($Referer)['csrftoken'].Value
+        }
+	} catch [System.Net.WebException] {
         Write-VenDebugLog "REST call failed to $($Uri.AbsoluteUri)"
 		if ($_.Exception.Response) {
-			[string] $debug_msg = "Status Code of response : {0}" -f $_.Exception.Response.StatusCode.value__.ToString()
-            Write-VenDebugLog $debug_msg
-			$debug_msg = Select-ErrorMessage $_.Exception
-            Write-VenDebugLog $debug_msg
+            Write-VenDebugLog "|| Response Status Code: $($_.Exception.Response.StatusCode.value__.ToString())"
 		}
-		else {
-			$debug_msg = Select-ErrorMessage $_.Exception
-            Write-VenDebugLog $debug_msg
-		}
+        Write-VenDebugLog "|| $(Select-ErrorMessage $_.Exception)"
 		throw $_
 	}
+
+    $AviReply
 }
 
-function Get-AviSession( [string] $addr, [string] $user, [string] $pass )
+function New-AviApiSession
 {
+    [CmdletBinding(DefaultParameterSetName='ApiLogin')]
+    Param(
+        [Parameter(Mandatory, ParameterSetName='ApiLogin', ValueFromPipeline)]
+        [System.Collections.Hashtable] $General,
+
+        [Parameter(Mandatory, ParameterSetName='RefreshApi', ValueFromPipeline)]
+        [Microsoft.PowerShell.Commands.WebRequestSession] $Session
+    )
+
     Write-VenDebugLog "Called by $((Get-PSCallStack)[1].Command)"
 
-    [string] $url = "https://{0}/login" -f $addr
-    $body = @{
-        "username"=$user;
-        "password"=$pass
-    } | ConvertTo-Json
-    Write-VenDebugLog "Login to [$($addr)] as [$($user)]"
-	$resp_obj = Invoke-AviRestMethod -Uri $url -Method Post -Body $body -ContentType "application/json" -SessionVariable session -TimeoutSec 300
-	$response = $resp_obj.response
-	$session = $resp_obj.session
-	$x_avi_version = $response.version.Version
-    Write-VenDebugLog "Logged into AVI controller [$($addr)] (Version $($x_avi_version)) as [$($user)]"
-	$session.Headers.Add([string] "X-Avi-Version", $x_avi_version)
-	$session.Headers.Add([string] "content-type", [string] "application/json")
-	$session.Headers.Add([string] "referer", [string] "https://$addr")
-	$session.Headers.Add([string] "x-csrftoken", $($session.Cookies.GetCookies("https://$addr")["csrftoken"].Value))
-	return $session
+    if ($General) {
+        # Extract variables required for session from General hashtable
+        $AviHost   = $General.HostAddress
+        $UserName  = $General.UserName
+        $UserPass  = $General.UserPass
+        if ($General.VarText2) {
+            $AviTenant = $General.VarText2
+        } else {
+            $AviTenant = '*'
+        }
+    } elseif ($Session) {
+        # Extract variables required for session from existing/old session
+        $AviHost   = (([System.Uri]($Session.Headers['Referer'])).Host)
+        $UserName  = $Session.Credentials.UserName
+        $UserPass  = $Session.Credentials.GetNetworkCredential().Password
+        $AviTenant = $Session.Headers['X-Avi-Tenant']
+    }
+
+    $RequestBody = @{ 'username'=$UserName; 'password'=$UserPass } | ConvertTo-Json
+    $ApiLogin = @{
+        'Uri'             = [System.Uri]"https://$($AviHost)/login"
+        'Method'          = 'Post'
+        'TimeoutSec'      = 30
+        'ContentType'     = 'application/json'
+        'Body'            = $RequestBody
+        'SessionVariable' = 'NewWebSession'
+    }
+
+    try {
+        Write-VenDebugLog "Logging into AVI controller [$($AviHost)] as [$($UserName)]"
+        $AviReply = Invoke-RestMethod @ApiLogin -ErrorVariable InvokeError
+        if (-not $AviReply.user.username) {
+            "Login Failure: $($AviReply|ConvertTo-Json -Depth 5)" | Write-VenDebugLog -ThrowException
+        }
+    } catch [System.Net.WebException] {
+        Write-VenDebugLog "REST call failed to $($ApiLogin.Uri.AbsoluteUri)"
+		if ($_.Exception.Response) {
+            Write-VenDebugLog "Response Status Code: $($_.Exception.Response.StatusCode.value__.ToString())"
+		}
+        Write-VenDebugLog "$(Select-ErrorMessage $_.Exception)"
+		throw $_
+    } catch {
+        # Generic catch block for any other terminating errors
+        Write-VenDebugLog "An unexpected error occurred: $($_.Exception.Message)"
+    }
+
+    $AviVersion = $AviReply.version.Version
+    Write-VenDebugLog "Login successful: AVI controller is running version [$($AviVersion)]"
+	$NewWebSession.Headers.Add('X-Avi-Version', $AviVersion)
+	$NewWebSession.Headers.Add('X-Avi-Tenant',  $AviTenant)
+	$NewWebSession.Headers.Add('Content-Type',  'application/json')
+	$NewWebSession.Headers.Add('Referer',       "https://$($AviHost)")
+	$NewWebSession.Headers.Add('X-CSRFToken',   $($NewWebSession.Cookies.GetCookies("https://$($AviHost)")['csrftoken'].Value))
+
+    $SecureStringPassword      = ConvertTo-SecureString -String $UserPass -AsPlainText -Force
+    $NewWebSession.Credentials = New-Object System.Management.Automation.PSCredential($UserName, $SecureStringPassword)
+
+    $NewWebSession
 }
 
-function Get-AllVs([System.Collections.Hashtable] $General, [Microsoft.PowerShell.Commands.WebRequestSession] $session)
+function Get-AviVirtualServices
 {
+	Param(
+        [Parameter(Mandatory)]
+		[Microsoft.PowerShell.Commands.WebRequestSession] $WebSession,
+
+        [int] $TimeoutSec = 300
+	)
+
     Write-VenDebugLog "Called by $((Get-PSCallStack)[1].Command)"
 
-    [string] $all_vs_request_url = "https://{0}/api/virtualservice" -f $General.HostAddress
-    $headers = @{
-        "X-Avi-Tenant"="*";
+    $ApiCall = 0
+    $VirtualServicesList = @()
+    $uri = "$($WebSession.Headers['Referer'])/api/virtualservice"
+    while ($uri) {
+        # Keep retrieving virtual services until we have them all
+        $ApiCall++
+        $AviReply = Invoke-AviRestApi -Uri $uri -Method Get -TimeoutSec $TimeoutSec -WebSession $WebSession
+        $VirtualServicesList += $AviReply.results
+        if (($AviReply.next) -or ($ApiCall -gt 1)) {
+            Write-VenDebugLog "API call #$($ApiCall) returned $($AviReply.results.Count) more virtual servers (Total So Far: $($VirtualServicesList.Count))"
+        }
+        $uri = $AviReply.next
     }
-	$resp_obj = Invoke-AviRestMethod -Uri $all_vs_request_url -Method Get -Headers $headers -ContentType "application/json" -WebSession $session -TimeoutSec 300
-	# modified - everything below this line changed in some way...
-    $vsCount = $resp_obj.response.count
-    $vsList  = $resp_obj.response.results
-    $apiCall = 1
-    Write-VenDebugLog "API returned $(@($resp_obj.response.results).Count) virtual servers"
-    while ($null -ne $resp_obj.response.next) {
-        $apiCall++
-        $resp_obj = Invoke-AviRestMethod -Uri ($resp_obj.response.next) -Method Get -Headers $headers -ContentType "application/json" -WebSession $session -TimeoutSec 300
-        $vsList += $resp_obj.response.results
-        Write-VenDebugLog "API returned $(@($resp_obj.response.results).Count) more virtual servers"
-    }
-    Write-VenDebugLog "Retrieved [$($vsCount)] virtual servers via [$($apiCall)] API calls to [$($General.HostAddress)]"
-	return $vsList
+
+    $Summary = "DONE: Retrieved [$($VirtualServicesList.Count)] virtual servers"
+    if ($ApiCall -gt 1) { $Summary += " via [$($ApiCall)] API calls" }
+    Write-VenDebugLog $Summary
+
+    $VirtualServicesList
 }
 
 function Get-Tenant-Name-By-Ref([System.Collections.Hashtable] $General, [string] $tref, [System.Collections.Hashtable] $ref_content_map, [Microsoft.PowerShell.Commands.WebRequestSession] $session)
 {
     Write-VenDebugLog "Called by $((Get-PSCallStack)[1].Command)"
 
-    if(-Not $ref_content_map.$tref){
-        $headers = @{
-            "content-type"="application/json";
-            "referer"="https://$($General.HostAddress)";
-            "x-csrftoken"=$($session.Cookies.GetCookies("https://$($General.HostAddress)")["csrftoken"].Value)
-        }
-		$resp_obj = Invoke-AviRestMethod -Uri $tref -Method Get -Headers $headers -ContentType "application/json" -WebSession $session -TimeoutSec 300
-		$response = $resp_obj.response
-		$ref_content_map.$tref = $response.name
+    if (-not $ref_content_map.$tref) {
+        $AviReply = Invoke-AviRestApi -Uri $tref -Method Get -WebSession $session
+		$ref_content_map.$tref = $AviReply.name
         Write-VenDebugLog "Added tenant name to cache: [$($ref_content_map.$tref)]"
-    }
-    else {
+    } else {
         Write-VenDebugLog "Tenant name retrieved from cache: [$($ref_content_map.$tref)]"
     }
-    return $ref_content_map.$tref
+
+    $ref_content_map.$tref
 }
 
 function Get-Certificate-By-Ref([System.Collections.Hashtable] $General, [string] $ssl_ref, [System.Collections.Hashtable] $ref_content_map, [Microsoft.PowerShell.Commands.WebRequestSession] $session)
 {
     Write-VenDebugLog "Called by $((Get-PSCallStack)[1].Command)"
 
-    if(-Not $ref_content_map.$ssl_ref){
-        $headers = @{
-            "content-type"="application/json";
-            "referer"="https://$($General.HostAddress)";
-            "x-csrftoken"=$($session.Cookies.GetCookies("https://$($General.HostAddress)")["csrftoken"].Value)
-        }
-		$resp_obj = Invoke-AviRestMethod -Uri $ssl_ref -Method Get -Headers $headers -ContentType "application/json" -WebSession $session -TimeoutSec 300
-		$response = $resp_obj.response
-		$ref_content_map.$ssl_ref = $response.certificate.certificate
+    if (-not $ref_content_map.$ssl_ref) {
+        $AviReply = Invoke-AviRestApi -Uri $ssl_ref -Method Get -WebSession $session
+		$ref_content_map.$ssl_ref = $AviReply.certificate.certificate
         Write-VenDebugLog "Added certificate to cache: [$($ssl_ref)]"
-    }
-    else {
+    } else {
         Write-VenDebugLog "Certificate retrieved from cache: [$($ssl_ref)]"
     }
-    return $ref_content_map.$ssl_ref
+
+    $ref_content_map.$ssl_ref
 }
 
 # modified - add a function to perform certificate filename lookup
@@ -1029,43 +1093,30 @@ function Get-Cert-Name-By-Ref([System.Collections.Hashtable] $General, [string] 
     Write-VenDebugLog "Called by $((Get-PSCallStack)[1].Command)"
 
     $ssl_name_ref = "$($ssl_ref)/name"
-    if(-Not $ref_content_map.$ssl_name_ref){
-        $headers = @{
-            "content-type"="application/json";
-            "referer"="https://$($General.HostAddress)";
-            "x-csrftoken"=$($session.Cookies.GetCookies("https://$($General.HostAddress)")["csrftoken"].Value)
-        }
-		$resp_obj = Invoke-AviRestMethod -Uri $ssl_ref -Method Get -Headers $headers -ContentType "application/json" -WebSession $session -TimeoutSec 300
-		$response = $resp_obj.response
-		$ref_content_map.$ssl_name_ref = $response.name
+    if (-not $ref_content_map.$ssl_name_ref) {
+        $AviReply = Invoke-AviRestApi -Uri $ssl_ref -Method Get -WebSession $session
+		$ref_content_map.$ssl_name_ref = $AviReply.name
         Write-VenDebugLog "Added filename to cache: [$($ref_content_map.$ssl_name_ref)]"
-    }
-    else {
+    } else {
         Write-VenDebugLog "Filename retrieved from cache: [$($ref_content_map.$ssl_name_ref)]"
     }
-    return $ref_content_map.$ssl_name_ref
+
+    $ref_content_map.$ssl_name_ref
 }
 
 function Get-IPv4-VIP([System.Collections.Hashtable] $General, $vs, [Microsoft.PowerShell.Commands.WebRequestSession] $session)
 {
     Write-VenDebugLog "Called by $((Get-PSCallStack)[1].Command)"
 
-    $headers = @{
-        "content-type"="application/json";
-        "referer"="https://$($General.HostAddress)";
-        "x-csrftoken"=$($session.Cookies.GetCookies("https://$($General.HostAddress)")["csrftoken"].Value)
-    }
-	$resp_obj = Invoke-AviRestMethod -Uri $vs.vsvip_ref -Method Get -Headers $headers -ContentType "application/json" -WebSession $session -TimeoutSec 300
-	$response = $resp_obj.response
+    $AviReply = Invoke-AviRestApi -Uri $vs.vsvip_ref -Method Get -WebSession $session
 
-    foreach ($vip_def in $response.vip) {
+    foreach ($vip_def in $AviReply.vip) {
         if ($vip_def.floating_ip) {
             if ($vip_def.floating_ip.type -eq "V4") {
                 Write-VenDebugLog "Floating IP for $($vs.name) is $($vip_def.floating_ip.addr)"
                 return $vip_def.floating_ip.addr
             }
-        }
-        elseif ($vip_def.ip_address.type -eq "V4") {
+        } elseif ($vip_def.ip_address.type -eq "V4") {
             Write-VenDebugLog "No floating IP for $($vs.name). Private IP is $($vip_def.ip_address.addr)"
             return $vip_def.ip_address.addr
         }
@@ -1073,11 +1124,12 @@ function Get-IPv4-VIP([System.Collections.Hashtable] $General, $vs, [Microsoft.P
     Write-VenDebugLog "Returning... nothing?!"
 }
 
-function Get-SSL-Service-Port($vs_json){
+function Get-SSL-Service-Port($vs_json)
+{
     Write-VenDebugLog "Called by $((Get-PSCallStack)[1].Command)"
 
-    foreach($port in $vs_json.services){
-        if($port.enable_ssl -eq $True){
+    foreach($port in $vs_json.services) {
+        if ($port.enable_ssl -eq $true) {
             [string] $vsPort = $port.port
             Write-VenDebugLog "Service port for $($vs_json.name) is $($vsPort)"
 			return $vsPort
@@ -1086,38 +1138,48 @@ function Get-SSL-Service-Port($vs_json){
     Write-VenDebugLog "Returning... nothing?!"
 }
 
-function Get-CACertName( [System.Security.Cryptography.X509Certificates.X509Certificate2] $cert )
+function Get-CACertName
 {
+    Param(
+        [Parameter(Mandatory, ValueFromPipeline)]
+        [System.Security.Cryptography.X509Certificates.X509Certificate2] $CACert
+    )
+
     # name should not have any non-alphanumeric characters including whitespace
     $alphanumeric = '[^a-zA-Z0-9]'
     
     # use GetNameInfo to be consistent with Microsoft's naming
-    $name = $cert.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+    $name = $CACert.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
     $name = $name -replace $alphanumeric
     
     # append the last 4 characters of the serial number in case there has been reissuance of the CA certificate
-    return $name + "_" + $cert.SerialNumber.Substring($cert.SerialNumber.Length-4)
+    return $name + "_" + $CACert.SerialNumber.Substring($CACert.SerialNumber.Length-4)
 }
 
 
-function Select-ErrorMessage( [Exception] $ex )
+function Select-ErrorMessage
 {
+    Param(
+        [Parameter(Position=0, Mandatory, ValueFromPipeline)]
+        [Exception] $ex
+    )
+
     try {
         $result = $ex.Response.GetResponseStream()
         $reader = New-Object System.IO.StreamReader($result)
         $reader.BaseStream.Position = 0
         $reader.DiscardBufferedData()
         $json = $reader.ReadToEnd() | ConvertFrom-Json
-        
-        if ( $json.error ) {
-            return $json.error
-        }
-        else {
-            return $ex.Message
-        }
+    } catch {
+        # The response doesn't contain an error message or isn't JSON
+        # Ignore error and continue processing
     }
-    catch # the response is either not xml or not in the expected format
-    {
-        return $ex.Message
+
+    # If we decoded an error string in the JSON return that
+    if ($json.error) {
+        return $json.error
     }
+
+    # Otherwise return the exception error message
+    return $ex.Message
 }
