@@ -39,7 +39,7 @@ Passwd|Not Used|000
 -----END FIELD DEFINITIONS-----
 #>
 
-$Script:AdaptableAppVer = '202507011057'
+$Script:AdaptableAppVer = '202507011124'
 $Script:AdaptableAppDrv = 'Avi-Networks'
 
 # need the following to interface with an untrusted certificate
@@ -874,8 +874,9 @@ function Initialize-VenDebugLog
         [System.Collections.Hashtable] $General
     )
 
+    $Caller = (Get-PSCallStack)[1].Command
     if ($Script:venDebugFile) {
-        Write-VenDebugLog "Called by $((Get-PSCallStack)[1].Command)"
+        Write-VenDebugLog "Called by $($Caller)"
         Write-VenDebugLog 'WARNING: Initialize-VenDebugLog() called more than once!'
         return
     }
@@ -895,11 +896,14 @@ function Initialize-VenDebugLog
     if ($General.HostAddress -ne '') {
         $Script:venDebugFile += "-$($General.HostAddress)"
     }
+    if ($Caller -eq 'Discover-Certificates') {
+        $Script:venDebugFile += '-Discovery'
+    }
     $Script:venDebugFile += ".log"
     
     Write-Output '' | Add-Content -Path $Script:venDebugFile
 
-    Write-VenDebugLog -NoFunctionTag -LogMessage "$($Script:AdaptableAppDrv) v$($Script:AdaptableAppVer): Venafi called $((Get-PSCallStack)[1].Command)"
+    Write-VenDebugLog -NoFunctionTag -LogMessage "$($Script:AdaptableAppDrv) v$($Script:AdaptableAppVer): Venafi called $($Caller)"
     Write-VenDebugLog -NoFunctionTag -LogMessage "PowerShell Environment: $($PSVersionTable.PSEdition) Edition, Version $($PSVersionTable.PSVersion.Major)"
 
     Write-VenDebugLog "Called by $((Get-PSCallStack)[1].Command)"
@@ -1095,6 +1099,9 @@ function Get-Certificate-By-Ref([System.Collections.Hashtable] $General, [string
         $AviReply = Invoke-AviRestApi -Uri $ssl_ref -Method Get -WebSession $session
 		$ref_content_map.$ssl_ref = $AviReply.certificate.certificate
         Write-VenDebugLog "Added certificate to cache: [$($ssl_ref)]"
+        $ssl_name_ref = "$($ssl_ref)/name"
+		$ref_content_map.$ssl_name_ref = $AviReply.name
+        Write-VenDebugLog "Added filename to cache: [$($ref_content_map.$ssl_name_ref)]"
     } else {
         Write-VenDebugLog "Certificate retrieved from cache: [$($ssl_ref)]"
     }
@@ -1110,6 +1117,8 @@ function Get-Cert-Name-By-Ref([System.Collections.Hashtable] $General, [string] 
     $ssl_name_ref = "$($ssl_ref)/name"
     if (-not $ref_content_map.$ssl_name_ref) {
         $AviReply = Invoke-AviRestApi -Uri $ssl_ref -Method Get -WebSession $session
+		$ref_content_map.$ssl_ref = $AviReply.certificate.certificate
+        Write-VenDebugLog "Added certificate to cache: [$($ssl_ref)]"
 		$ref_content_map.$ssl_name_ref = $AviReply.name
         Write-VenDebugLog "Added filename to cache: [$($ref_content_map.$ssl_name_ref)]"
     } else {
