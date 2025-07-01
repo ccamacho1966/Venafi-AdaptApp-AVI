@@ -39,7 +39,7 @@ Passwd|Not Used|000
 -----END FIELD DEFINITIONS-----
 #>
 
-$Script:AdaptableAppVer = '202507011355'
+$Script:AdaptableAppVer = '202507011619'
 $Script:AdaptableAppDrv = 'Avi-Networks'
 
 # need the following to interface with an untrusted certificate
@@ -206,7 +206,7 @@ function Generate-CSR
     }
 
     # Attempt to be nice and log out of the API
-    $WebSession | Remove-AviApiSession
+    $AviSession | Remove-AviApiSession
 
     Write-VenDebugLog 'Returning control to Venafi'
     $CsrText  = $AviReply.certificate.certificate_signing_request
@@ -300,7 +300,7 @@ function Install-Chain
     }
 
     # Attempt to be nice and log out of the API
-    $WebSession | Remove-AviApiSession
+    $AviSession | Remove-AviApiSession
 
     Write-VenDebugLog 'CA chain installed - Returning control to Venafi'
     return @{ Result='Success' }
@@ -439,7 +439,7 @@ function Install-Certificate
     }
 
     # Attempt to be nice and log out of the API
-    $WebSession | Remove-AviApiSession
+    $AviSession | Remove-AviApiSession
 
     return @{ Result='Success' }
 }
@@ -519,7 +519,7 @@ function Update-Binding
     }
 
     # Attempt to be nice and log out of the API
-    $WebSession | Remove-AviApiSession
+    $AviSession | Remove-AviApiSession
 
     Write-VenDebugLog "Virtual Service has been updated - Returning control to Venafi"
     return @{ Result='Success' }
@@ -640,7 +640,7 @@ function Extract-Certificate
     Write-VenDebugLog "Certificate Valid Until:   $($CertInUse.not_after) UTC"
 
     # Attempt to be nice and log out of the API
-    $WebSession | Remove-AviApiSession
+    $AviSession | Remove-AviApiSession
 
     Write-VenDebugLog "Certificate extracted successfully - Returning control to Venafi"
     return @{
@@ -701,7 +701,7 @@ function Extract-PrivateKey
     $PrivateKey = $AviReply.results.key
 
     # Attempt to be nice and log out of the API
-    $WebSession | Remove-AviApiSession
+    $AviSession | Remove-AviApiSession
 
     Write-VenDebugLog "Private key extracted successfully - Returning control to Venafi"
     return @{
@@ -765,7 +765,7 @@ function Remove-Certificate
     }
 
     # Attempt to be nice and log out of the API
-    $WebSession | Remove-AviApiSession
+    $AviSession | Remove-AviApiSession
 
     return @{ Result='Success' }
 }
@@ -840,7 +840,7 @@ function Discover-Certificates
     }
 
     # Attempt to be nice and log out of the API
-    $WebSession | Remove-AviApiSession
+    $AviSession | Remove-AviApiSession
 
     Write-VenDebugLog "$($sitesTotal) virtual servers ($($sitesSSL) discovered, $($sitesClear) ignored) - Returning control to Venafi"
     return @{
