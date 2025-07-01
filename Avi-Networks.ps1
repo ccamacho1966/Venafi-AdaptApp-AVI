@@ -39,7 +39,7 @@ Passwd|Not Used|000
 -----END FIELD DEFINITIONS-----
 #>
 
-$Script:AdaptableAppVer = '202506271745'
+$Script:AdaptableAppVer = '202507011057'
 $Script:AdaptableAppDrv = 'Avi-Networks'
 
 # need the following to interface with an untrusted certificate
@@ -913,7 +913,8 @@ function Invoke-AviRestApi
 		[System.Object] $Body,
 		[int] $TimeoutSec = 15,
 		[System.Collections.IDictionary] $Headers,
-		[Microsoft.PowerShell.Commands.WebRequestSession] $WebSession
+		[Microsoft.PowerShell.Commands.WebRequestSession] $WebSession,
+        [switch]$NoRetry
 	)
 
     Write-VenDebugLog "$((Get-PSCallStack)[1].Command)/$($Method): $($Uri)"
@@ -928,14 +929,13 @@ function Invoke-AviRestApi
         'Uri'         = $Uri
         'Method'      = $Method
         'TimeoutSec'  = $TimeoutSec
-        'ContentType' = 'application/json'
         'WebSession'  = $WebSession
     }
     if ($Headers) { $ApiRequest.Headers = $Headers }
     if ($Body)    { $ApiRequest.Body    = $Body }
 
 	try {
-        $AviReply = Invoke-RestMethod @ApiRequest
+        $AviReply = Invoke-RestMethod @ApiRequest -ContentType 'application/json'
         if ($WebSession.Headers['X-CSRFToken'] -ne $WebSession.Cookies.GetCookies($Referer)['csrftoken'].Value) {
             # Avi has updated the CSRF Token so we must update our headers or risk getting a 401 Unauthorized refusal
             Write-VenDebugLog "CSRF Token has been updated - Updating X-CSRFToken header"
@@ -944,10 +944,18 @@ function Invoke-AviRestApi
 	} catch [System.Net.WebException] {
         Write-VenDebugLog "REST call failed to $($Uri.AbsoluteUri)"
 		if ($_.Exception.Response) {
-            Write-VenDebugLog "|| Response Status Code: $($_.Exception.Response.StatusCode.value__.ToString())"
+            Write-VenDebugLog "|| Response Status Code: $($_.Exception.Response.StatusCode)"
 		}
         Write-VenDebugLog "|| $(Select-ErrorMessage $_.Exception)"
-		throw $_
+        if (($_.Exception.Response.StatusCode -eq 401) -and (-not $NoRetry)) {
+            # Attempt to reauthenticate and retry the API call once... just once.
+            $WebSession            = $WebSession | New-AviApiSession
+            $ApiRequest.WebSession = $WebSession
+            $AviReply              = Invoke-AviRestApi @ApiRequest -NoRetry
+        }
+        if (-not $AviReply) {
+		    throw $_
+        }
 	}
 
     $AviReply
@@ -1045,8 +1053,14 @@ function Get-AviVirtualServices
         $ApiCall++
         $AviReply = Invoke-AviRestApi -Uri $uri -Method Get -TimeoutSec $TimeoutSec -WebSession $WebSession
         $VirtualServicesList += $AviReply.results
-        if (($AviReply.next) -or ($ApiCall -gt 1)) {
-            Write-VenDebugLog "API call #$($ApiCall) returned $($AviReply.results.Count) more virtual servers (Total So Far: $($VirtualServicesList.Count))"
+        if (($AviReply.next) -and ($ApiCall -eq 1)) {
+            $s = ''
+            if ($AviReply.results.Count -ne 1) { $s = 's'}
+            Write-VenDebugLog "API call #1 returned $($AviReply.results.Count) virtual server$($s)"
+        } elseif (($AviReply.next) -or ($ApiCall -gt 1)) {
+            $s = ''
+            if ($AviReply.results.Count -ne 1) { $s = 's'}
+            Write-VenDebugLog "API call #$($ApiCall) returned $($AviReply.results.Count) more virtual server$($s) (Total So Far: $($VirtualServicesList.Count))"
         }
         $uri = $AviReply.next
     }
@@ -1170,7 +1184,8 @@ function Select-ErrorMessage
         $reader = New-Object System.IO.StreamReader($result)
         $reader.BaseStream.Position = 0
         $reader.DiscardBufferedData()
-        $json = $reader.ReadToEnd() | ConvertFrom-Json
+        $rawResponse = $reader.ReadToEnd()
+        $json = $rawResponse | ConvertFrom-Json
     } catch {
         # The response doesn't contain an error message or isn't JSON
         # Ignore error and continue processing
@@ -1179,6 +1194,11 @@ function Select-ErrorMessage
     # If we decoded an error string in the JSON return that
     if ($json.error) {
         return $json.error
+    } elseif ($json.detail) {
+        return $json.detail
+    } else {
+        # Write the raw results to the log file for further debugging
+        Write-VenDebugLog "Raw Error Response: $($rawResponse)"
     }
 
     # Otherwise return the exception error message
