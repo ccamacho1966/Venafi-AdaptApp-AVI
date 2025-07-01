@@ -39,7 +39,7 @@ Passwd|Not Used|000
 -----END FIELD DEFINITIONS-----
 #>
 
-$Script:AdaptableAppVer = '202507011124'
+$Script:AdaptableAppVer = '202507011355'
 $Script:AdaptableAppDrv = 'Avi-Networks'
 
 # need the following to interface with an untrusted certificate
@@ -205,6 +205,9 @@ function Generate-CSR
         Write-VenDebugLog "API ERROR (Generate CSR): $(Select-ErrorMessage($_.Exception))" -ThrowException
     }
 
+    # Attempt to be nice and log out of the API
+    $WebSession | Remove-AviApiSession
+
     Write-VenDebugLog 'Returning control to Venafi'
     $CsrText  = $AviReply.certificate.certificate_signing_request
 
@@ -295,6 +298,9 @@ function Install-Chain
     } catch {
         throw Select-ErrorMessage($_.Exception)
     }
+
+    # Attempt to be nice and log out of the API
+    $WebSession | Remove-AviApiSession
 
     Write-VenDebugLog 'CA chain installed - Returning control to Venafi'
     return @{ Result='Success' }
@@ -432,6 +438,9 @@ function Install-Certificate
         "Unexpected Error: $(Select-ErrorMessage($_.Exception))" | Write-VenDebugLog -ThrowException
     }
 
+    # Attempt to be nice and log out of the API
+    $WebSession | Remove-AviApiSession
+
     return @{ Result='Success' }
 }
 
@@ -508,6 +517,9 @@ function Update-Binding
     } catch {
         "API ERROR (Update Virtual Service): $(Select-ErrorMessage($_.Exception))" | Write-VenDebugLog -ThrowException
     }
+
+    # Attempt to be nice and log out of the API
+    $WebSession | Remove-AviApiSession
 
     Write-VenDebugLog "Virtual Service has been updated - Returning control to Venafi"
     return @{ Result='Success' }
@@ -627,6 +639,9 @@ function Extract-Certificate
     Write-VenDebugLog "Certificate Thumbprint:    $($Thumbprint)"
     Write-VenDebugLog "Certificate Valid Until:   $($CertInUse.not_after) UTC"
 
+    # Attempt to be nice and log out of the API
+    $WebSession | Remove-AviApiSession
+
     Write-VenDebugLog "Certificate extracted successfully - Returning control to Venafi"
     return @{
         Result     = 'Success'
@@ -684,6 +699,9 @@ function Extract-PrivateKey
 
     # Private key for certificate has been found - Parse results and return data to Venafi
     $PrivateKey = $AviReply.results.key
+
+    # Attempt to be nice and log out of the API
+    $WebSession | Remove-AviApiSession
 
     Write-VenDebugLog "Private key extracted successfully - Returning control to Venafi"
     return @{
@@ -745,6 +763,9 @@ function Remove-Certificate
             Write-VenDebugLog "API ERROR (Delete Certificate): $(Select-ErrorMessage($_.Exception))"
         }
     }
+
+    # Attempt to be nice and log out of the API
+    $WebSession | Remove-AviApiSession
 
     return @{ Result='Success' }
 }
@@ -817,6 +838,9 @@ function Discover-Certificates
             Write-VenDebugLog "Ignored: [$($vs.name)] is unencrypted"
 		}
     }
+
+    # Attempt to be nice and log out of the API
+    $WebSession | Remove-AviApiSession
 
     Write-VenDebugLog "$($sitesTotal) virtual servers ($($sitesSSL) discovered, $($sitesClear) ignored) - Returning control to Venafi"
     return @{
@@ -1036,6 +1060,37 @@ function New-AviApiSession
     $NewWebSession.Credentials = New-Object System.Management.Automation.PSCredential($UserName, $SecureStringPassword)
 
     $NewWebSession
+}
+
+function Remove-AviApiSession
+{
+    [CmdletBinding()]
+    Param(
+        [Parameter(Mandatory, ValueFromPipeline)]
+        [Microsoft.PowerShell.Commands.WebRequestSession] $WebSession
+    )
+
+    Write-VenDebugLog "Called by $((Get-PSCallStack)[1].Command)"
+
+    $AviHost         = (([System.Uri]($WebSession.Headers['Referer'])).Host)
+    $UserName        = $WebSession.Credentials.UserName
+    [System.Uri]$Uri = "https://$($AviHost)/logout"
+    Write-VenDebugLog "Logging [$($UserName)] out of AVI controller [$($AviHost)]"
+
+    # Try to logout but do not throw terminating errors for a failed logout
+    # At this point we're done talking to the Avi so the logout is cleanup, but not mandatory
+    try {
+        Invoke-AviRestApi -Uri $Uri -Method Post -WebSession $WebSession | Out-Null
+    } catch [System.Net.WebException] {
+        Write-VenDebugLog "REST call failed to $($Uri.AbsoluteUri)"
+		if ($_.Exception.Response) {
+            Write-VenDebugLog "Response Status Code: $($_.Exception.Response.StatusCode.value__.ToString())"
+		}
+        Write-VenDebugLog "$(Select-ErrorMessage $_.Exception)"
+    } catch {
+        # Generic catch block for any other terminating errors
+        Write-VenDebugLog "An unexpected error occurred: $($_.Exception.Message)"
+    }
 }
 
 function Get-AviVirtualServices
