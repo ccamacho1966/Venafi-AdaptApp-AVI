@@ -39,7 +39,7 @@ Passwd|Not Used|000
 -----END FIELD DEFINITIONS-----
 #>
 
-$Script:AdaptableAppVer = '202507011619'
+$Script:AdaptableAppVer = '202609281809'
 $Script:AdaptableAppDrv = 'Avi-Networks'
 
 # need the following to interface with an untrusted certificate
@@ -1230,9 +1230,17 @@ function Get-CACertName
     # use GetNameInfo to be consistent with Microsoft's naming
     $name = $CACert.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
     $name = $name -replace $alphanumeric
-    
-    # append the last 4 characters of the serial number in case there has been reissuance of the CA certificate
-    return $name + "_" + $CACert.SerialNumber.Substring($CACert.SerialNumber.Length-4)
+
+    # We can't always count on the serial number being 5+ characters long
+    if ($CACert.SerialNumber.Length -gt 4) {
+        # append the last 4 characters of the serial number in case there has been reissuance of the CA certificate
+        $CAname = $name + "_" + $CACert.SerialNumber.Substring($CACert.SerialNumber.Length-4)
+    } else {
+        # if the serial number is less than 5 characters long, just append the whole serial number
+        $CAname = $name + "_" + $CACert.SerialNumber
+    }
+
+    return $CAname
 }
 
 
