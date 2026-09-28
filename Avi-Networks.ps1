@@ -32,15 +32,38 @@ Text1|Virtual Service|100
 Text2|Tenant|100
 Text3|Not Used|000
 Text4|Not Used|000
-Text5|Not Used|000
+Text5|Avi Driver Options|110
 Option1|Debug Avi Driver|110
 Option2|Not Used|000
 Passwd|Not Used|000
 -----END FIELD DEFINITIONS-----
 #>
 
-$Script:AdaptableAppVer = '202507011619'
+$Script:AdaptableAppVer = '202609281814'
 $Script:AdaptableAppDrv = 'Avi-Networks'
+
+$Script:DebugOptions = @{
+    APIBody      = $false
+    APICalls     = $false
+    APIReplyV    = $false
+    APIReplyA    = $false
+    Discovered   = $false
+    DumpGeneral  = $false
+    DumpSpecific = $false
+    CallFunction = $false
+    RedactData   = $true
+}
+
+$Script:SensitiveFields = (
+    'Password',
+    'UserPass',
+    'AuxPass',
+    'VarPass',
+    'UserPrivKey',
+    'PassPhrase',
+    'Private_Key',
+    'Certificate'
+)
 
 # need the following to interface with an untrusted certificate
 Add-Type -TypeDefinition @"
@@ -56,6 +79,8 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
 "@
 [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
 
+
+#region Prepare-KeyStore
 <##################################################################################################
 .NAME
     Prepare-KeyStore
@@ -95,8 +120,10 @@ function Prepare-KeyStore
 
     return @{ Result='NotUsed' }
 }
+#endregion Prepare-KeyStore
 
 
+#region Generate-KeyPair
 <##################################################################################################
 .NAME
     Generate-KeyPair
@@ -126,8 +153,10 @@ function Generate-KeyPair
    
     return @{ Result='NotUsed' }
 }
+#endregion Generate-KeyPair
 
 
+#region Generate-CSR
 <##################################################################################################
 .NAME
     Generate-CSR
@@ -216,8 +245,10 @@ function Generate-CSR
         Pkcs10 = $CsrText
     }
 }
+#endregion Generate-CSR
 
 
+#region Install-Chain
 <##################################################################################################
 .NAME
     Install-Chain
@@ -305,8 +336,10 @@ function Install-Chain
     Write-VenDebugLog 'CA chain installed - Returning control to Venafi'
     return @{ Result='Success' }
 }
+#endregion Install-Chain
 
 
+#region Install-PrivateKey
 <##################################################################################################
 .NAME
     Install-PrivateKey
@@ -335,8 +368,10 @@ function Install-PrivateKey
 
     return @{ Result='NotUsed' }
 }
+#endregion Install-PrivateKey
 
 
+#region Install-Certificate
 <##################################################################################################
 .NAME
     Install-Certificate
@@ -443,8 +478,10 @@ function Install-Certificate
 
     return @{ Result='Success' }
 }
+#endregion Install-Certificate
 
 
+#region Update-Binding
 <##################################################################################################
 .NAME
     Update-Binding
@@ -524,7 +561,10 @@ function Update-Binding
     Write-VenDebugLog "Virtual Service has been updated - Returning control to Venafi"
     return @{ Result='Success' }
 }
+#endregion Update-Binding
 
+
+#region Activate-Certificate
 <##################################################################################################
 .NAME
     Activate-Certificate
@@ -548,8 +588,10 @@ function Activate-Certificate
     
     return @{ Result='NotUsed' }
 }
+#endregion Activate-Certificate
 
 
+#region Extract-Certificate
 <##################################################################################################
 .NAME
     Extract-Certificate
@@ -650,8 +692,10 @@ function Extract-Certificate
         Thumbprint = $Thumbprint
     }
 }
+#endregion Extract-Certificate
 
 
+#region Extract-PrivateKey
 <##################################################################################################
 .NAME
     Extract-PrivateKey
@@ -709,8 +753,10 @@ function Extract-PrivateKey
         PrivateKeyPem = $PrivateKey
     }
 }
+#endregion Extract-PrivateKey
 
 
+#region Remove-Certificate
 <##################################################################################################
 .NAME
     Remove-Certificate
@@ -769,8 +815,10 @@ function Remove-Certificate
 
     return @{ Result='Success' }
 }
+#endregion Remove-Certificate
 
 
+#region Discover-Certificates
 <##################################################################################################
 .NAME
     Discover-Certificates
@@ -848,12 +896,15 @@ function Discover-Certificates
         Applications = $ApplicationList
     }
 }
+#endregion Discover-Certificates
+
 
 <########## THE FUNCTIONS AND CODE BELOW THIS LINE ARE NOT CALLED DIRECTLY BY VENAFI ##########>
 
 # replace the original Write-AviLog function with an improved function set that will
 # not mix up logs (especially for discoveries) and provide more useful file names
 
+#region VenDebugLog
 # Take a message, prepend a timestamp, output it to a debug log ... if DEBUG_FILE is set
 # Otherwise do nothing and return nothing
 function Write-VenDebugLog
@@ -895,10 +946,15 @@ function Initialize-VenDebugLog
 {
     Param(
         [Parameter(Position=0, Mandatory, ValueFromPipeline)]
-        [System.Collections.Hashtable] $General
+        [System.Collections.Hashtable] $General,
+
+        [Parameter(Position=1)]
+        [System.Collections.Hashtable]$Specific = $null
     )
 
     $Caller = (Get-PSCallStack)[1].Command
+
+    # if the debugfile is already setup we shouldn't be called again - log a warning
     if ($Script:venDebugFile) {
         Write-VenDebugLog "Called by $($Caller)"
         Write-VenDebugLog 'WARNING: Initialize-VenDebugLog() called more than once!'
@@ -930,27 +986,173 @@ function Initialize-VenDebugLog
     Write-VenDebugLog -NoFunctionTag -LogMessage "$($Script:AdaptableAppDrv) v$($Script:AdaptableAppVer): Venafi called $($Caller)"
     Write-VenDebugLog -NoFunctionTag -LogMessage "PowerShell Environment: $($PSVersionTable.PSEdition) Edition, Version $($PSVersionTable.PSVersion.Major)"
 
-    Write-VenDebugLog "Called by $((Get-PSCallStack)[1].Command)"
+    # Process advanced debug options
+    if ($General.VarText5) {
+        $AdvDebugOptions = $General.VarText5.Trim() -split "[ ,|]" | Where-Object -FilterScript { $_ }
+        if ($AdvDebugOptions -contains 'CallFunction') {
+            Write-VenDebugLog "Called by $($Caller)"
+            Write-VenDebugLog "Advanced Debug: Function calls will be output to the debug logs"
+            $Script:DebugOptions.CallFunction = $true
+        }
+        if ($AdvDebugOptions -contains 'UnmaskFields') {
+            Write-VenDebugLog "Advanced Debug: Sensitive fields will not be redacted (UnmaskFields)"
+            $Script:DebugOptions.RedactData = $false
+        }
+        if ($AdvDebugOptions -contains 'APIBody') {
+            Write-VenDebugLog "Advanced Debug: API body will be output to the debug logs"
+            $Script:DebugOptions.APIBody = $true
+        }
+        if ($AdvDebugOptions -contains 'APICalls') {
+            Write-VenDebugLog "Advanced Debug: API calls will be output to the debug logs"
+            $Script:DebugOptions.APICalls = $true
+        }
+        if ($AdvDebugOptions -contains 'APIReplyAll') {
+            Write-VenDebugLog "Advanced Debug: All API replies will be output to the debug logs"
+            $Script:DebugOptions.APIReplyA = $true
+            $Script:DebugOptions.APIReplyV = $true
+        } else {
+            if ($AdvDebugOptions -contains 'APIReplyA') {
+                Write-VenDebugLog "Advanced Debug: Avi API replies will be output to the debug logs"
+                $Script:DebugOptions.APIReplyA = $true
+            }
+            if ($AdvDebugOptions -contains 'APIReplyV') {
+                Write-VenDebugLog "Advanced Debug: Venafi API replies will be output to the debug logs"
+                $Script:DebugOptions.APIReplyV = $true
+            }
+        }
+        if ($AdvDebugOptions -contains 'Discovered') {
+            Write-VenDebugLog "Advanced Debug: Discovered app list will be output to the debug logs"
+            $Script:DebugOptions.Discovered = $true
+        }
+        if ($AdvDebugOptions -contains 'DumpGeneral') {
+            Write-VenDebugLog "Advanced Debug: Including dump of variables from the GENERAL hashtable"
+            $RedactedData = $General|Remove-RedactedValues
+            foreach ($key in ($RedactedData.Keys|Sort-Object)) {
+                if ($null -eq $RedactedData[$key]) {
+                    $keytype = 'NULL'
+                } else {
+                    $keytype = $RedactedData[$key].GetType()
+                }
+                Add-Content -Path $Script:venDebugFile ">>>>> $($key)[$($keytype)]: [$($RedactedData[$key])]"
+            }
+        }
+        if ($AdvDebugOptions -contains 'DumpSpecific') {
+            if ($Specific) {
+                Write-VenDebugLog "Advanced Debug: Including dump of variables from the SPECIFIC hashtable"
+                # Specific hashtable is never redacted - nothing would be left to log!
+                $RedactedData = $Specific
+                foreach ($key in ($RedactedData.Keys|Sort-Object)) {
+                    if ($null -eq $RedactedData[$key]) {
+                        $keytype = 'NULL'
+                    } else {
+                        $keytype = $RedactedData[$key].GetType()
+                    }
+                    Add-Content -Path $Script:venDebugFile ">>>>> $($key)[$($keytype)]: [$($RedactedData[$key])]"
+                }
+            }
+        }
+    }
+}
+#endregion VenDebugLog
+
+
+function Remove-RedactedValues
+{
+    Param(
+        [Parameter(Mandatory,ValueFromPipeline,Position=0)]
+        [System.Object] $InputObject
+    )
+
+    if ($Script:DebugOptions.CallFunction) {
+        Write-VenDebugLog "Called by $((Get-PSCallStack)[1].Command)"
+    }
+
+    # Return the original object if sensitive data is not being redacted
+    if (-not $Script:DebugOptions.RedactData) {
+        Write-VenDebugLog 'Sensitive fields have been unmasked - Doing nothing'
+        return $InputObject
+    }
+
+    $i=0
+    if ($InputObject.GetType().Name -eq 'Hashtable') {
+        # Create a shallow copy of the hashtable
+        $RedactedData = $InputObject.Clone()
+
+        # Mask sensitive values in the COPY of the input object
+        foreach ($key in $InputObject.keys) {
+            if ($key -in $Script:SensitiveFields) {
+                if ($InputObject[$key]) {
+                    $i++
+                    $RedactedData[$key] = '<<<REDACTED>>>'
+                }
+            }
+        }
+    } elseif ($InputObject.GetType().Name -eq 'PSCustomObject') {
+        # Use JSON conversions to force a reasonably accurate copy
+        $RedactedData = $InputObject|ConvertTo-Json -Depth 9|ConvertFrom-Json
+
+        # Mask sensitive values in the COPY of the input object
+        foreach ($property in $InputObject.psobject.Properties) {
+            if ($property.Name -in $Script:SensitiveFields) {
+                if ($InputObject.($property.Name)) {
+                    $i++
+                    $RedactedData.($property.Value) = '<<<REDACTED>>>'
+                }
+            }
+        }
+    } else {
+        # Return the original object if not a hashtable or PSCustomObject
+        Write-VenDebugLog "not a hashtable or pscustomobject (type: $($InputObject.GetType().Name))"
+        return $InputObject
+    }
+
+    # Log how many fields have been redacted
+    if ($i) {
+        if ($i -gt 1) { $s = 's' } else { $s = '' }
+        Write-VenDebugLog "Redacted $($i) field$($s)"
+    }
+
+    # Return the redacted copy of the original object
+    $RedactedData
 }
 
+
+#region Invoke-AviRestApi
 function Invoke-AviRestApi
 {
 	Param(
-		[System.Uri] $Uri,
-		[Microsoft.PowerShell.Commands.WebRequestMethod] $Method,
-		[System.Object] $Body,
-		[int] $TimeoutSec = 15,
-		[System.Collections.IDictionary] $Headers,
-		[Microsoft.PowerShell.Commands.WebRequestSession] $WebSession,
+        [Parameter(Mandatory)]
+        [System.Uri] $Uri,
+
+        [Microsoft.PowerShell.Commands.WebRequestMethod] $Method,
+
+        [System.Object] $Body,
+
+        [int] $TimeoutSec = 15,
+
+        [System.Collections.IDictionary] $Headers,
+
+        [Microsoft.PowerShell.Commands.WebRequestSession] $WebSession,
+
         [switch]$NoRetry
 	)
 
-    Write-VenDebugLog "$((Get-PSCallStack)[1].Command)/$($Method): $($Uri)"
+    if ($Script:DebugOptions.APICalls -or $Script:DebugOptions.CallFunction) {
+        Write-VenDebugLog "$((Get-PSCallStack)[1].Command)/$($Method): $($Uri)"
+    }
 
     $Referer = $WebSession.Headers['Referer']
     if (-not $Uri.IsAbsoluteUri) {
         # Convert a relative path supplied by the API back into a full Uri
-        $Uri = ([System.Uri] ("https://$($Referer)$($Uri.OriginalString)"))
+        if ($Referer -match 'https://.*') {
+            $Uri = ([System.Uri] ("$($Referer)$($Uri.OriginalString)"))
+        } else {
+            $Uri = ([System.Uri] ("https://$($Referer)$($Uri.OriginalString)"))
+        }
+        if ($Script:DebugOptions.APICalls) {
+            Write-VenDebugLog "Referer: $($Referer)"
+            Write-VenDebugLog "Updated Absolute Uri: $($Uri)"
+        }
     }
 
     $ApiRequest = @{
@@ -960,13 +1162,36 @@ function Invoke-AviRestApi
         'WebSession'  = $WebSession
     }
     if ($Headers) { $ApiRequest.Headers = $Headers }
-    if ($Body)    { $ApiRequest.Body    = $Body }
+
+    # Convert body hashtable to JSON and optionally log the possibly redacted result
+    if ($Body)       {
+        if ($Body.GetType().Name -eq 'Hashtable') {
+            # Convert the hashtable to JSON
+            $ApiRequest.ContentType = 'application/json'
+            $ApiRequest.Body        = ($Body|ConvertTo-Json -Depth 9)
+            if ($Script:DebugOptions.APIBody) {
+                # Log the possibly redacted body json
+                Write-VenDebugLog "API Call Body:`n$($Body|Remove-RedactedValues|ConvertTo-Json -Depth 9)"
+            }
+        } else {
+            $ApiRequest.Body        = $Body
+            if ($Script:DebugOptions.APIBody) {
+                # Log the raw body string (cannot be redacted)
+                Write-VenDebugLog "API Call Body: $($Body)"
+            }
+        }
+    }
 
 	try {
         $AviReply = Invoke-RestMethod @ApiRequest -ContentType 'application/json'
+        if ($Script:DebugOptions.ApiReplyA) {
+            Write-VenDebugLog "API Reply:`n$($AviReply|Remove-RedactedValues|ConvertTo-Json -Depth 9)"
+        }
         if ($WebSession.Headers['X-CSRFToken'] -ne $WebSession.Cookies.GetCookies($Referer)['csrftoken'].Value) {
             # Avi has updated the CSRF Token so we must update our headers or risk getting a 401 Unauthorized refusal
-            Write-VenDebugLog "CSRF Token has been updated - Updating X-CSRFToken header"
+            if ($Script:DebugOptions.ApiReplyA) {
+                Write-VenDebugLog "CSRF Token has been updated - Updating X-CSRFToken header"
+            }
             $WebSession.Headers['X-CSRFToken']  =  $WebSession.Cookies.GetCookies($Referer)['csrftoken'].Value
         }
 	} catch [System.Net.WebException] {
@@ -975,6 +1200,7 @@ function Invoke-AviRestApi
             Write-VenDebugLog "|| Response Status Code: $($_.Exception.Response.StatusCode)"
 		}
         Write-VenDebugLog "|| $(Select-ErrorMessage $_.Exception)"
+        $AviReply = $null
         if (($_.Exception.Response.StatusCode -eq 401) -and (-not $NoRetry)) {
             # Attempt to reauthenticate and retry the API call once... just once.
             $WebSession            = $WebSession | New-AviApiSession
@@ -988,6 +1214,8 @@ function Invoke-AviRestApi
 
     $AviReply
 }
+#endregion Invoke-AviRestApi
+
 
 function New-AviApiSession
 {
@@ -1104,31 +1332,45 @@ function Get-AviVirtualServices
 
     Write-VenDebugLog "Called by $((Get-PSCallStack)[1].Command)"
 
-    $ApiCall = 0
-    $VirtualServicesList = @()
-    $uri = "$($WebSession.Headers['Referer'])/api/virtualservice"
+    $VSList   = @()
+    $uri      = "$($WebSession.Headers['Referer'])/api/virtualservice"
+    $ApiCall  = 0
+    $Expected = -1
     while ($uri) {
-        # Keep retrieving virtual services until we have them all
         $ApiCall++
+        # Keep retrieving virtual services until we have them all
+        $AviReply = $null
         $AviReply = Invoke-AviRestApi -Uri $uri -Method Get -TimeoutSec $TimeoutSec -WebSession $WebSession
-        $VirtualServicesList += $AviReply.results
-        if (($AviReply.next) -and ($ApiCall -eq 1)) {
-            $s = ''
-            if ($AviReply.results.Count -ne 1) { $s = 's'}
-            Write-VenDebugLog "API call #1 returned $($AviReply.results.Count) virtual server$($s)"
-        } elseif (($AviReply.next) -or ($ApiCall -gt 1)) {
-            $s = ''
-            if ($AviReply.results.Count -ne 1) { $s = 's'}
-            Write-VenDebugLog "API call #$($ApiCall) returned $($AviReply.results.Count) more virtual server$($s) (Total So Far: $($VirtualServicesList.Count))"
+        $uri = $null
+        if ($AviReply) {
+            if ($Expected -lt 0) {
+                $Expected = $AviReply.count
+                if ($Expected -eq 1) { $s = '' } else { $s = 's' }
+                Write-VenDebugLog "Controller reports $($Expected) total virtual server$($s)"
+            }
+            $VSList += $AviReply.results
+            if (($AviReply.next) -and ($ApiCall -eq 1)) {
+                $s = ''
+                if ($AviReply.results.Count -ne 1) { $s = 's'}
+                Write-VenDebugLog "API call #1 returned $($AviReply.results.Count) virtual server$($s)"
+            } elseif (($AviReply.next) -or ($ApiCall -gt 1)) {
+                $s = ''
+                if ($AviReply.results.Count -ne 1) { $s = 's'}
+                Write-VenDebugLog "API call #$($ApiCall) returned $($AviReply.results.Count) more virtual server$($s) (Total So Far: $($VSList.Count) of $($Expected))"
+            }
+            if ($VSList.Count -gt $Expected) {
+                $fatal = "Expected $($Expected) but processed $($VSList.Count) so far --ABORT!!"
+                $fatal | Write-VenDebugLog -ThrowException
+            }
+            $uri = $AviReply.next
         }
-        $uri = $AviReply.next
     }
 
-    $Summary = "DONE: Retrieved [$($VirtualServicesList.Count)] virtual servers"
+    $Summary = "DONE: Retrieved [$($VSList.Count)] virtual servers"
     if ($ApiCall -gt 1) { $Summary += " via [$($ApiCall)] API calls" }
     Write-VenDebugLog $Summary
 
-    $VirtualServicesList
+    $VSList
 }
 
 function Get-Tenant-Name-By-Ref([System.Collections.Hashtable] $General, [string] $tref, [System.Collections.Hashtable] $ref_content_map, [Microsoft.PowerShell.Commands.WebRequestSession] $session)
@@ -1230,9 +1472,17 @@ function Get-CACertName
     # use GetNameInfo to be consistent with Microsoft's naming
     $name = $CACert.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
     $name = $name -replace $alphanumeric
-    
-    # append the last 4 characters of the serial number in case there has been reissuance of the CA certificate
-    return $name + "_" + $CACert.SerialNumber.Substring($CACert.SerialNumber.Length-4)
+
+    # We can't always count on the serial number being 5+ characters long
+    if ($CACert.SerialNumber.Length -gt 4) {
+        # append the last 4 characters of the serial number in case there has been reissuance of the CA certificate
+        $CAname = $name + "_" + $CACert.SerialNumber.Substring($CACert.SerialNumber.Length-4)
+    } else {
+        # if the serial number is less than 5 characters long, just append the whole serial number
+        $CAname = $name + "_" + $CACert.SerialNumber
+    }
+
+    return $CAname
 }
 
 
